@@ -977,6 +977,7 @@ class DistAttnRuntime:
                 softmax_scale=softmax_scale,
                 softcap=softcap,
                 sink_layout="sh",
+                deterministic=self.deterministic,
             )
             partial_dkv = self._maybe_concat(partial_dk, partial_dv, need_concat=True)
         else:
