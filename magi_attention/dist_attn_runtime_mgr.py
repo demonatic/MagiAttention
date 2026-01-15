@@ -68,6 +68,7 @@ class DistAttnRuntimeKey:
     is_native_grpcoll_enable: bool
     is_fa4_backend_enable: bool
 
+
 class DistAttnRuntimeMgr:
     def __init__(
         self,
