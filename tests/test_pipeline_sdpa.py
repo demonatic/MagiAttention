@@ -111,9 +111,9 @@ class TestPipelineSDPABaseWithWorldSize1(DistTestBase):
                 print(
                     f"The NCCL group {nccl_group} cannot be registered due to error: \n{e}\n"
                 )
-                
+
         # -----    set up for flags   ---- #
-                
+
         self.flag_to_envvar = {
             "device_max_connections": "CUDA_DEVICE_MAX_CONNECTIONS",
             "deterministic_mode": "MAGI_ATTENTION_DETERMINISTIC_MODE",
@@ -131,7 +131,8 @@ class TestPipelineSDPABaseWithWorldSize1(DistTestBase):
             options={
                 "device_max_connections": [1, 8],
                 "enable_native_grpcoll": (
-                    [False, True] if native_grpcoll_registered 
+                    [False, True]
+                    if native_grpcoll_registered
                     # disable native grpcoll if not registered successfully
                     else [False]
                 ),
