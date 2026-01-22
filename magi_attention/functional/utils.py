@@ -351,46 +351,53 @@ def correct_attn_out(
 
 correct_attn_out_compiled = torch.compile(dynamic=True)(correct_attn_out)
 
-
 def correct_attn_fwd_result(
     out_list: list[torch.Tensor], lse_list: list[torch.Tensor], inplace: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Corrects the attention result given all of the partial out and lse
-
     Args:
         out_list (list[torch.Tensor]): the list of partial out tensors
         lse_list (list[torch.Tensor]): the list of partial lse tensors
         inplace (bool, optional):
             whether to reduce the corrected results to the first ``out`` and ``lse``
             in the list inplace. Defaults to ``False``.
-
     Returns:
         tuple[torch.Tensor, torch.Tensor]: the corrected out and lse
-
     Shape:
         out: [seqlen_q, num_heads_q, head_dim]
         lse: [seqlen_q, num_heads_q]
     """
     assert len(out_list) == len(lse_list) and len(out_list) >= 1
-
+    assert len(out_list) == 2
     corrected_out, corrected_lse = out_list[0], lse_list[0]
-    for i in range(1, len(out_list)):
-        last_lse = corrected_lse.clone() if inplace else corrected_lse
-        corrected_lse = correct_attn_lse_compiled(
-            lse1=corrected_lse,
-            lse2=lse_list[i],
-            inplace=inplace,
-        )
-        corrected_out = correct_attn_out_compiled(
-            out1=corrected_out,
-            lse1=last_lse,
-            out2=out_list[i],
-            lse2=lse_list[i],
-            lse=corrected_lse,
-            inplace=inplace,
-        )
-
+    out_to_correct, lse_to_correct = out_list[1], lse_list[1]
+    from magi_attention.common.range_op import range_reduce
+    range_reduce(
+        input=out_to_correct,
+        output=corrected_out,
+        input_ranges=torch.tensor([[0, out_to_correct.size(0)]], dtype=torch.int64, device='cuda'),
+        output_ranges=torch.tensor([[0, corrected_out.size(0)]], dtype=torch.int64, device='cuda'),
+        reduce_op="lse",
+        input_lse=lse_to_correct,
+        output_lse=corrected_lse,
+    )
+    # corrected_out, corrected_lse = out_list[0], lse_list[0]
+    # for i in range(1, len(out_list)):
+    #     last_lse = corrected_lse.clone() if inplace else corrected_lse
+    #     corrected_lse = correct_attn_lse_compiled(
+    #         lse1=corrected_lse,
+    #         lse2=lse_list[i],
+    #         inplace=inplace,
+    #     )
+    #     corrected_out = correct_attn_out_compiled(
+    #         out1=corrected_out,
+    #         lse1=last_lse,
+    #         out2=out_list[i],
+    #         lse2=lse_list[i],
+    #         lse=corrected_lse,
+    #         inplace=inplace,
+    #     )
     return corrected_out, corrected_lse
 
 
