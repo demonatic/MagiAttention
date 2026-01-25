@@ -47,6 +47,10 @@ def fa4_fwd(
 
     # Rearrange q,k,v: (s, h, d) -> (1, s, h, d)
     q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
+
+    print(f"[SYNC][FA4] Before _flash_attn_fwd (q={q.shape}, k={k.shape})...", flush=True)
+    torch.cuda.synchronize()
+
     out, lse = _flash_attn_fwd(
         q,
         k,
@@ -65,6 +69,9 @@ def fa4_fwd(
         block_sparse_tensors=fa4_args["linear_k_block_sparse_mask"],
         aux_tensors=fa4_args["aux_tensors"],
     )
+
+    torch.cuda.synchronize()
+    print(f"[SYNC][FA4] After _flash_attn_fwd...", flush=True)
 
     # Rearrange out: (1, s, h, d) -> (s, h, d)
     out = out.squeeze(0)
@@ -101,6 +108,9 @@ def fa4_bwd(
     # Rearrange lse: (s, h) -> (1, h, s)
     lse = lse.mT.unsqueeze(0).contiguous()
 
+    print(f"[SYNC][FA4] Before _flash_attn_bwd (q={q.shape}, k={k.shape})...", flush=True)
+    torch.cuda.synchronize()
+
     dq, dk, dv = _flash_attn_bwd(
         q=q,
         k=k,
@@ -116,6 +126,10 @@ def fa4_bwd(
         aux_tensors=fa4_args["aux_tensors"],
         deterministic=deterministic,
     )
+
+    torch.cuda.synchronize()
+    print(f"[SYNC][FA4] After _flash_attn_bwd...", flush=True)
+
     dsink = None
 
     # Rearrange dq,dk,dv: (1, s, h, d) -> (s, h, d)

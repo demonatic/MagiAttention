@@ -215,6 +215,9 @@ class FA4AttnArg(AttnArg):
             f"seqlen_q={self.seqlen_q}-seqlen_k={self.seqlen_k}-"
             f"n_ub_func={n_ub_func}"
         ):
+            print(f"[SYNC][FA4] Before magi_to_hstu (seqlen_q={self.seqlen_q}, seqlen_k={self.seqlen_k})...", flush=True)
+            torch.cuda.synchronize()
+
             hstu_func = magi_to_hstu_cuda.magi_to_hstu(
                 q_ranges=self.ffa_fwd_args_dict["q_ranges"],
                 k_ranges=self.ffa_fwd_args_dict["k_ranges"],
@@ -224,8 +227,18 @@ class FA4AttnArg(AttnArg):
                 n_max_func=n_ub_func,
             )
 
+            torch.cuda.synchronize()
+            print(f"[SYNC][FA4] After magi_to_hstu...", flush=True)
+
             # Get actual func count from sliced output
             self.n_func = hstu_func.size(0)
+
+            # DEBUG: Print n_func info for precision debugging
+            print(f"[FA4AttnArg DEBUG] n_ub_func={n_ub_func}, n_func={self.n_func}, "
+                  f"is_odd={self.n_func % 2 == 1}, "
+                  f"seqlen_q={self.seqlen_q}, seqlen_k={self.seqlen_k}, "
+                  f"num_ranges={len(self.k_ranges)}, "
+                  f"hstu_func_shape={hstu_func.shape}")
 
             hstu_func = hstu_func.unsqueeze(0).unsqueeze(0)
 
@@ -283,6 +296,9 @@ class FA4AttnArg(AttnArg):
                 f"create_q2k_csr_sparse_from_func-"
                 f"seqlen_q={self.seqlen_q}-seqlen_k={self.seqlen_k}"
             ):
+                print(f"[SYNC][FA4] Before create_q2k_csr_sparse_from_func...", flush=True)
+                torch.cuda.synchronize()
+
                 # Q2K (Forward): fix q_block, loop kv_blocks
                 (
                     cuda_k_mask_cnt,
@@ -299,6 +315,9 @@ class FA4AttnArg(AttnArg):
                     KV_BLOCK_SIZE=self.tile_n,
                     check_q_boundary=False,
                 )
+
+                torch.cuda.synchronize()
+                print(f"[SYNC][FA4] After create_q2k_csr_sparse_from_func...", flush=True)
 
                 # Convert to LinearBlockSparseTensorsTorch format
                 # CUDA kernel returns:
@@ -317,6 +336,9 @@ class FA4AttnArg(AttnArg):
                 f"create_k2q_csr_sparse_from_func-"
                 f"seqlen_q={self.seqlen_q}-seqlen_k={self.seqlen_k}"
             ):
+                print(f"[SYNC][FA4] Before create_k2q_csr_sparse_from_func...", flush=True)
+                torch.cuda.synchronize()
+
                 # K2Q (Backward): fix kv_block, loop q_blocks
                 (
                     cuda_q_mask_cnt,
@@ -332,6 +354,9 @@ class FA4AttnArg(AttnArg):
                     Q_BLOCK_SIZE=self.tile_m,
                     KV_BLOCK_SIZE=self.tile_n,
                 )
+
+                torch.cuda.synchronize()
+                print(f"[SYNC][FA4] After create_k2q_csr_sparse_from_func...", flush=True)
 
                 linear_q_block_sparse_mask = LinearBlockSparseTensorsTorch(
                     mask_block_cnt=cuda_q_mask_cnt.flatten(),

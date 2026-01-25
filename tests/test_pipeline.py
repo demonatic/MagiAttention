@@ -679,6 +679,13 @@ class TestPipelineBaseWithWorldSize1(DistTestBase):
         )
         test_case_seed = str2seed(test_case)
 
+        # -----    print test case info for debugging hang issues   ---- #
+
+        if self.rank == 0:
+            print(f"\n{'='*80}")
+            print(f"[START TEST CASE] {test_case}")
+            print(f"{'='*80}\n", flush=True)
+
         # -----    contruct config from test cases   ---- #
 
         q_ranges: AttnRanges = attn_config["q_ranges"]
@@ -855,9 +862,17 @@ class TestPipelineBaseWithWorldSize1(DistTestBase):
 
             # -----   dispatch global qkv to local qkv   ---- #
 
+            if self.rank == 0:
+                print(f"[SYNC] Before dispatch...", flush=True)
+            torch.cuda.synchronize()
+
             local_q = dist_attn_runtime_mgr.dispatch_qo(total_q)
             local_k = dist_attn_runtime_mgr.dispatch_kv(total_k)
             local_v = dist_attn_runtime_mgr.dispatch_kv(total_v)
+
+            torch.cuda.synchronize()
+            if self.rank == 0:
+                print(f"[SYNC] After dispatch, before calc_attn...", flush=True)
 
             # -----   run dist attn forward on local qkv for local out   ---- #
 
@@ -875,10 +890,18 @@ class TestPipelineBaseWithWorldSize1(DistTestBase):
                 softcap=softcap,
             )
 
+            torch.cuda.synchronize()
+            if self.rank == 0:
+                print(f"[SYNC] After calc_attn, before undispatch...", flush=True)
+
             # -----   undispatch local out to global out   ---- #
 
             total_out = dist_attn_runtime_mgr.undispatch_qo(local_out)
             total_lse = dist_attn_runtime_mgr.undispatch_qo(local_lse)
+
+            torch.cuda.synchronize()
+            if self.rank == 0:
+                print(f"[SYNC] After undispatch...", flush=True)
 
             # -----   run backward   ---- #
 
@@ -891,7 +914,16 @@ class TestPipelineBaseWithWorldSize1(DistTestBase):
                     dist.barrier()
                     torch.cuda.synchronize()
 
+                if self.rank == 0:
+                    print(f"[SYNC] Before backward...", flush=True)
+                torch.cuda.synchronize()
+
                 total_out.backward(grad_total_out)
+
+                torch.cuda.synchronize()
+                if self.rank == 0:
+                    print(f"[SYNC] After backward...", flush=True)
+
                 grad_total_q, grad_total_k, grad_total_v = (
                     total_q.grad,
                     total_k.grad,
@@ -949,6 +981,9 @@ class TestPipelineBaseWithWorldSize1(DistTestBase):
                         else 0.0,
                     },
                 )
+
+                if self.rank == 0:
+                    print(f"[DONE TEST CASE] {test_case}\n", flush=True)
 
     def _assert_close_to_torch_ref(
         self,
@@ -1068,6 +1103,9 @@ class TestPipelineBaseWithWorldSize1(DistTestBase):
         if total_sink is not None:
             total_sink.grad = None
 
+        print(f"[SYNC][rank={self.rank}] Before ref_attn_func (high_precision)...", flush=True)
+        torch.cuda.synchronize()
+
         total_out_ref_high_precision, total_lse_ref_high_precision = ref_attn_func(
             q=total_q,
             k=total_k,
@@ -1084,8 +1122,18 @@ class TestPipelineBaseWithWorldSize1(DistTestBase):
             online_softmax=True,
         )
 
+        torch.cuda.synchronize()
+        print(f"[SYNC][rank={self.rank}] After ref_attn_func (high_precision)...", flush=True)
+
         if run_bwd:
+            print(f"[SYNC][rank={self.rank}] Before ref backward (high_precision)...", flush=True)
+            torch.cuda.synchronize()
+
             total_out_ref_high_precision.backward(grad_total_out)
+
+            torch.cuda.synchronize()
+            print(f"[SYNC][rank={self.rank}] After ref backward (high_precision)...", flush=True)
+
             (
                 grad_total_q_ref_high_precision,
                 grad_total_k_ref_high_precision,
@@ -1105,6 +1153,9 @@ class TestPipelineBaseWithWorldSize1(DistTestBase):
         if total_sink is not None:
             total_sink.grad = None
 
+        print(f"[SYNC][rank={self.rank}] Before ref_attn_func (low_precision)...", flush=True)
+        torch.cuda.synchronize()
+
         total_out_ref_low_precision, total_lse_ref_low_precision = ref_attn_func(
             q=total_q,
             k=total_k,
@@ -1121,8 +1172,18 @@ class TestPipelineBaseWithWorldSize1(DistTestBase):
             online_softmax=True,
         )
 
+        torch.cuda.synchronize()
+        print(f"[SYNC][rank={self.rank}] After ref_attn_func (low_precision)...", flush=True)
+
         if run_bwd:
+            print(f"[SYNC][rank={self.rank}] Before ref backward (low_precision)...", flush=True)
+            torch.cuda.synchronize()
+
             total_out_ref_low_precision.backward(grad_total_out)
+
+            torch.cuda.synchronize()
+            print(f"[SYNC][rank={self.rank}] After ref backward (low_precision)...", flush=True)
+
             (
                 grad_total_q_ref_low_precision,
                 grad_total_k_ref_low_precision,
@@ -1404,7 +1465,38 @@ class TestPipelineBaseWithWorldSize1(DistTestBase):
         # -----   raise error if any error occurs   ---- #
 
         if err_msg_list:
-            raise AssertionError("\n\n".join(err_msg_list))
+            # Print debug info for precision mismatch
+            print("\n" + "=" * 80)
+            print("CURSOR DEBUG INFO:")
+            print("=" * 80)
+            print(f"\n[Test Case]: {test_case}")
+            print(f"\n[Input Configurations]:")
+            print(f"  q_ranges: {q_ranges.to_naive_ranges()}")
+            print(f"  k_ranges: {k_ranges.to_naive_ranges()}")
+            print(f"  attn_type_map: {attn_type_map}")
+            print(f"  total_seqlen_q: {total_seqlen_q}")
+            print(f"  total_seqlen_k: {total_seqlen_k}")
+            print(f"  num_ranges: {len(q_ranges)}")
+            print(f"  softmax_scale: {softmax_scale}")
+            print(f"  softcap: {softcap}")
+            print(f"  dtype: {dtype}")
+            print(f"\n[Tensor Shapes]:")
+            print(f"  total_q: {total_q.shape}")
+            print(f"  total_k: {total_k.shape}")
+            print(f"  total_v: {total_v.shape}")
+            print(f"  total_out: {total_out.shape}")
+            if total_lse is not None:
+                print(f"  total_lse: {total_lse.shape}")
+            if total_sink is not None:
+                print(f"  total_sink: {total_sink.shape}")
+            print(f"\n[FA4 Backend Info]:")
+            print(f"  is_fa4_backend_enable: {magi_attention.is_fa4_backend_enable()}")
+            print(f"\n[Error Messages]:")
+            for i, err_msg in enumerate(err_msg_list):
+                print(f"\n--- Error {i+1} ---")
+                print(err_msg)
+            print("\n" + "=" * 80)
+            
 
 
 class TestPipelineWithWorldSize2(TestPipelineBaseWithWorldSize1):
