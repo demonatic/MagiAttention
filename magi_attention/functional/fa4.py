@@ -51,6 +51,31 @@ def fa4_fwd(
     print(f"[SYNC][FA4] Before _flash_attn_fwd (q={q.shape}, k={k.shape})...", flush=True)
     torch.cuda.synchronize()
 
+    # Dump kernel inputs for debugging (only when MAGI_ATTENTION_DUMP_FA4=1)
+    import os
+    if os.environ.get("MAGI_ATTENTION_DUMP_FA4", "0") == "1":
+        import torch.distributed as dist
+        dump_dir = os.environ.get("MAGI_ATTENTION_DUMP_DIR", "/tmp/fa4_dumps")
+        os.makedirs(dump_dir, exist_ok=True)
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        dump_path = os.path.join(dump_dir, f"fa4_fwd_rank{rank}.pt")  # Overwrite each time
+        torch.save({
+            "q": q.detach().cpu(),
+            "k": k.detach().cpu(),
+            "v": v.detach().cpu(),
+            "softmax_scale": softmax_scale,
+            "softcap": softcap,
+            "sink": sink.detach().cpu() if sink is not None else None,
+            "q_ranges": attn_arg.q_ranges.to_naive_ranges(),
+            "k_ranges": attn_arg.k_ranges.to_naive_ranges(),
+            "attn_type_map": attn_arg.attn_type_map,
+            "seqlen_q": attn_arg.seqlen_q,
+            "seqlen_k": attn_arg.seqlen_k,
+            "n_func": attn_arg.n_func,
+            "aux_tensors": [t.detach().cpu() for t in fa4_args["aux_tensors"]] if fa4_args.get("aux_tensors") else None,
+        }, dump_path)
+        print(f"[FA4 DUMP] Saved fwd inputs to {dump_path}", flush=True)
+
     out, lse = _flash_attn_fwd(
         q,
         k,
@@ -110,6 +135,34 @@ def fa4_bwd(
 
     print(f"[SYNC][FA4] Before _flash_attn_bwd (q={q.shape}, k={k.shape})...", flush=True)
     torch.cuda.synchronize()
+
+    # Dump kernel inputs for debugging (only when MAGI_ATTENTION_DUMP_FA4=1)
+    import os
+    if os.environ.get("MAGI_ATTENTION_DUMP_FA4", "0") == "1":
+        import torch.distributed as dist
+        dump_dir = os.environ.get("MAGI_ATTENTION_DUMP_DIR", "/tmp/fa4_dumps")
+        os.makedirs(dump_dir, exist_ok=True)
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        dump_path = os.path.join(dump_dir, f"fa4_bwd_rank{rank}.pt")  # Overwrite each time
+        torch.save({
+            "q": q.detach().cpu(),
+            "k": k.detach().cpu(),
+            "v": v.detach().cpu(),
+            "o": o.detach().cpu(),
+            "do": do.detach().cpu(),
+            "lse": lse.detach().cpu(),
+            "softmax_scale": softmax_scale,
+            "softcap": softcap,
+            "deterministic": deterministic,
+            "q_ranges": attn_arg.q_ranges.to_naive_ranges(),
+            "k_ranges": attn_arg.k_ranges.to_naive_ranges(),
+            "attn_type_map": attn_arg.attn_type_map,
+            "seqlen_q": attn_arg.seqlen_q,
+            "seqlen_k": attn_arg.seqlen_k,
+            "n_func": attn_arg.n_func,
+            "aux_tensors": [t.detach().cpu() for t in fa4_args["aux_tensors"]] if fa4_args.get("aux_tensors") else None,
+        }, dump_path)
+        print(f"[FA4 DUMP] Saved bwd inputs to {dump_path}", flush=True)
 
     dq, dk, dv = _flash_attn_bwd(
         q=q,
