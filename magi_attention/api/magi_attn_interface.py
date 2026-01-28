@@ -488,24 +488,27 @@ def magi_attn_flex_key(
         num_heads_kv=num_heads_kv,
     )
 
-    # init dist attn runtime mgr and map it to the key
-    if key not in dist_attn_runtime_dict.keys():
-        dist_attn_runtime_dict[key] = init_dist_attn_runtime_mgr(
-            q_ranges=q_ranges,
-            k_ranges=k_ranges,
-            attn_mask_type=attn_mask_type,
-            total_seqlen_q=total_seqlen_q,
-            total_seqlen_k=total_seqlen_k,
-            chunk_size=chunk_size,
-            cp_group=cp_group,
-            is_same_source=is_same_source,
-            is_q_permutable=is_q_permutable,
-            is_k_permutable=is_k_permutable,
-            dist_attn_config=dist_attn_config,
-            cp_mesh=cp_mesh,
-            num_heads_q=num_heads_q,
-            num_heads_kv=num_heads_kv,
-        )
+    # Always create dist attn runtime mgr to avoid cache hit/miss inconsistency
+    # across different ranks in the same CP group, which can cause deadlocks.
+    # The cache check is removed because LRU eviction may differ between ranks,
+    # leading to one rank entering init_dist_attn_runtime_mgr (calling all_gather_object)
+    # while another rank skips it (cache hit), causing the first rank to hang.
+    dist_attn_runtime_dict[key] = init_dist_attn_runtime_mgr(
+        q_ranges=q_ranges,
+        k_ranges=k_ranges,
+        attn_mask_type=attn_mask_type,
+        total_seqlen_q=total_seqlen_q,
+        total_seqlen_k=total_seqlen_k,
+        chunk_size=chunk_size,
+        cp_group=cp_group,
+        is_same_source=is_same_source,
+        is_q_permutable=is_q_permutable,
+        is_k_permutable=is_k_permutable,
+        dist_attn_config=dist_attn_config,
+        cp_mesh=cp_mesh,
+        num_heads_q=num_heads_q,
+        num_heads_kv=num_heads_kv,
+    )
 
     return key
 
@@ -1151,25 +1154,24 @@ def make_flex_key_for_new_mask_after_dispatch(
         num_heads_kv=num_heads_kv,
     )
 
-    # init new dist attn runtime mgr and map it to the new key
-    if new_key not in dist_attn_runtime_dict.keys():
-        dist_attn_runtime_dict[new_key] = init_dist_attn_runtime_mgr(
-            q_ranges=q_ranges,
-            k_ranges=k_ranges,
-            attn_mask_type=attn_mask_type,
-            total_seqlen_q=total_seqlen_q,
-            total_seqlen_k=total_seqlen_k,
-            chunk_size=chunk_size,
-            cp_group=cp_group,
-            is_same_source=is_same_source,
-            is_q_permutable=is_q_permutable,
-            is_k_permutable=is_k_permutable,
-            dist_attn_config=new_dist_attn_config,
-            cp_mesh=cp_mesh,
-            ref_dispatch_meta_q=ref_dispatch_meta_q,
-            ref_dispatch_meta_k=ref_dispatch_meta_k,
-            num_heads_q=num_heads_q,
-            num_heads_kv=num_heads_kv,
-        )
+    # Always create new dist attn runtime mgr to avoid cache hit/miss inconsistency
+    dist_attn_runtime_dict[new_key] = init_dist_attn_runtime_mgr(
+        q_ranges=q_ranges,
+        k_ranges=k_ranges,
+        attn_mask_type=attn_mask_type,
+        total_seqlen_q=total_seqlen_q,
+        total_seqlen_k=total_seqlen_k,
+        chunk_size=chunk_size,
+        cp_group=cp_group,
+        is_same_source=is_same_source,
+        is_q_permutable=is_q_permutable,
+        is_k_permutable=is_k_permutable,
+        dist_attn_config=new_dist_attn_config,
+        cp_mesh=cp_mesh,
+        ref_dispatch_meta_q=ref_dispatch_meta_q,
+        ref_dispatch_meta_k=ref_dispatch_meta_k,
+        num_heads_q=num_heads_q,
+        num_heads_kv=num_heads_kv,
+    )
 
     return new_key
