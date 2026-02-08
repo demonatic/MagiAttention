@@ -126,6 +126,21 @@ def is_fa4_backend_enable() -> bool:
     return os.environ.get("MAGI_ATTENTION_FA4_BACKEND", "0") == "1"
 
 
+def is_fa4_calc_meta_skip_enable() -> bool:
+    """
+    Toggle this env variable to ``1`` to skip FA4 CalcMeta initialization
+    (magi_to_hstu, create_block_mask_cuda kernels) during key creation.
+
+    This is useful when you only need dispatch/undispatch but not calc_attn,
+    e.g. for debugging hang issues.
+
+    Default value is ``0``
+
+    WARNING: if enabled, calling calc_attn with FA4 backend will fail.
+    """
+    return os.environ.get("MAGI_ATTENTION_FA4_CALC_META_SKIP", "0") == "1"
+
+
 def is_cuda_device_max_connections_one() -> bool:
     """
     Check if "CUDA_DEVICE_MAX_CONNECTIONS" is set to ``1``,
