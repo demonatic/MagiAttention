@@ -201,8 +201,8 @@ class FA4AttnArg(AttnArg):
             # Useful when calc_attn is not called (e.g. only dispatch/undispatch)
             if not FA4AttnArg._fa4_calc_meta_skip_logged:
                 FA4AttnArg._fa4_calc_meta_skip_logged = True
-                magi_attention.logger.warning(
-                    "MAGI_ATTENTION_FA4_CALC_META_SKIP is enabled: "
+                print(
+                    "[MagiAttention] WARNING: MAGI_ATTENTION_FA4_CALC_META_SKIP is enabled: "
                     "skipping _transfer_ffa_args_to_fa4_args(). "
                     "calc_attn with FA4 backend will NOT work."
                 )
