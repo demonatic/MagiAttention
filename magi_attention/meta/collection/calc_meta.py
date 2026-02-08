@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import ClassVar
 
 import torch
 from torch.nn.attention.flex_attention import create_block_mask
@@ -183,8 +182,6 @@ class FA4AttnArg(AttnArg):
     seqlen_q: int = 0
     seqlen_k: int = 0
 
-    _fa4_calc_meta_skip_logged: ClassVar[bool] = False
-
     def __post_init__(self):
         assert is_fa4_installed, "FlashAttn4 is not installed"
         assert is_magi_to_hstu_installed, "magi_to_hstu_cuda is not installed"
@@ -196,26 +193,14 @@ class FA4AttnArg(AttnArg):
 
         super().__post_init__()
 
-        if magi_attention.is_fa4_calc_meta_skip_enable():
-            # Skip heavy FA4 init kernels (magi_to_hstu, create_block_mask, etc.)
-            # Useful when calc_attn is not called (e.g. only dispatch/undispatch)
-            if not FA4AttnArg._fa4_calc_meta_skip_logged:
-                FA4AttnArg._fa4_calc_meta_skip_logged = True
-                print(
-                    "[MagiAttention] WARNING: MAGI_ATTENTION_FA4_CALC_META_SKIP is enabled: "
-                    "skipping _transfer_ffa_args_to_fa4_args(). "
-                    "calc_attn with FA4 backend will NOT work."
-                )
-            self.fa4_fwd_args_dict = {}
-            self.fa4_bwd_args_dict = {}
-            return
-
-        # Transfer from FFA args to FA4 args
-        self._transfer_ffa_args_to_fa4_args()
-
-        # Clear FFA args
-        self.ffa_fwd_args_dict.clear()
-        self.ffa_bwd_args_dict.clear()
+        # Skip heavy FA4 init kernels (magi_to_hstu, create_block_mask, etc.)
+        print(
+            f"[MagiAttention] WARNING: skipping _transfer_ffa_args_to_fa4_args() "
+            f"(seqlen_q={self.seqlen_q}, seqlen_k={self.seqlen_k}). "
+            f"calc_attn with FA4 backend will NOT work."
+        )
+        self.fa4_fwd_args_dict = {}
+        self.fa4_bwd_args_dict = {}
 
     def _transfer_ffa_args_to_fa4_args(self) -> None:
         assert self.skip_attn_fwd == self.skip_attn_bwd
