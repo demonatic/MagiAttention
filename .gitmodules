@@ -4,4 +4,4 @@
 [submodule "magi_attention/functional/flash-attention"]
 	path = magi_attention/functional/flash-attention
 	url = https://github.com/demonatic/flash-attention.git
-	branch = magi_attn_blackwell_support
+	branch = jager/debug_print_compile_key
