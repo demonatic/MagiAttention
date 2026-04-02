@@ -20,9 +20,9 @@ if __name__ == "__main__":
     # Define the parameter space for grid search
     # to pre-compile ffa fa4 kernels for common cases
     dtypes = [torch.float16, torch.bfloat16]
-    head_dims = [64, 128]
-    qhead_per_kvhead = [1, 4]
-    func_nums = [2 * i + 1 for i in range(16)]  # 1, 3, 5, .., 31
+    head_dims = [80, 128]
+    qhead_per_kvhead = [1, 4, 8, 16]
+    func_nums = [1, 3, 5, 7]
 
     # Pre-compile the kernels for all combinations
     # in the defined parameter space

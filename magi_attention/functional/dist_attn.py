@@ -1200,7 +1200,7 @@ class DistAttnRuntime:
                     torch.maximum(max_logits_acc, meta.max_logits, out=max_logits_acc)
                     meta.max_logits = max_logits_acc
             elif self.use_fa4_backend:
-                partial_out, partial_lse = fa4_fwd(
+                partial_out, partial_lse, _ = fa4_fwd(
                     q=q,
                     k=k,
                     v=v,

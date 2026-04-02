@@ -23,11 +23,19 @@ from typing import Any, Dict, List
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
 import torch
+
+try:
+    import seaborn as sns
+except ImportError:
+    sns = None  # type: ignore[assignment]
 import torch.distributed as dist
 from matplotlib import patheffects as pe
-from py3nvml import py3nvml
+try:
+    from py3nvml import py3nvml
+except ImportError:
+    py3nvml = None  # type: ignore[assignment]
+
 from tqdm import tqdm
 
 from .image_grid import make_img_grid
@@ -37,6 +45,9 @@ from .image_grid import make_img_grid
 
 @contextmanager
 def nvml_context():
+    if py3nvml is None:
+        yield
+        return
     py3nvml.nvmlInit()
     yield
     py3nvml.nvmlShutdown()
@@ -53,6 +64,8 @@ class MemRecorder:
 
     @nvml_context()
     def get_alloc_memory_from_nvml(self):
+        if py3nvml is None:
+            return self.get_alloc_memory_from_torch()
         handle = py3nvml.nvmlDeviceGetHandleByIndex(self.device_idx)
         meminfo = py3nvml.nvmlDeviceGetMemoryInfo(handle)
         return meminfo.used
@@ -400,21 +413,29 @@ class Mark:
         save_csv: bool = True,
         **kwargs,
     ):
-        plt.style.use("seaborn-v0_8")
-        sns.set_theme(
-            style="whitegrid",
-            context="notebook",
-            rc={
-                "font.size": 12,
-                "axes.titlesize": 14,
-                "axes.labelsize": 12,
-                "legend.fontsize": 10,
-                "xtick.labelsize": 15,
-                "ytick.labelsize": 15,
-                "grid.linewidth": 1.2,
-            },
-        )
-        COLOR_PALETTE = sns.color_palette("viridis", n_colors=len(bench.line_names))
+        n_lines = len(bench.line_names)
+        if sns is not None:
+            plt.style.use("seaborn-v0_8")
+            sns.set_theme(
+                style="whitegrid",
+                context="notebook",
+                rc={
+                    "font.size": 12,
+                    "axes.titlesize": 14,
+                    "axes.labelsize": 12,
+                    "legend.fontsize": 10,
+                    "xtick.labelsize": 15,
+                    "ytick.labelsize": 15,
+                    "grid.linewidth": 1.2,
+                },
+            )
+            COLOR_PALETTE = sns.color_palette("viridis", n_colors=n_lines)
+        else:
+            plt.style.use("default")
+            COLOR_PALETTE = [
+                tuple(float(x) for x in plt.cm.viridis(i / max(n_lines - 1, 1))[:3])
+                for i in range(n_lines)
+            ]
 
         for perf_key in dfs:
             plt.figure(figsize=(14, 8), dpi=100)

@@ -58,7 +58,9 @@ from magi_attention.utils._utils import make_attn_mask_from_ffa_args
 
 # impls = ["ffa", "fa3", "fa4", "cudnn", "fa2", "flex", "sdpa"]  # all except torch native
 # impls = ["cudnn", "fa4", "ffa_fa4"] # for blackwell
-impls = ["ffa", "cudnn", "fa3", "fa4"]  # for hopper
+# ``fa4-max-score``: same as ``ffa_fa4`` but ``return_max_score=True`` (SM10 + flash_attn_cute w/ max_score_out).
+# Minimal set for SM100 + mounted flash-attention: ``fa4`` (cute), ``ffa_fa4`` / ``fa4-max-score`` (Magi). Add fa3/cudnn/ffa on your machine as needed.
+impls = ["fa4", "ffa_fa4", "fa4-max-score"]
 
 mask_types = ["full"]
 # mask_types = ["causal"]
@@ -118,9 +120,8 @@ attn_flops_configs = [
         line_arg="attn_impl",  # Argument name whose value corresponds to a different line in the plot.
         line_vals=impls,  # Possible values for `line_arg`.
         line_names=impls,  # Label name for the lines.
-        styles=[  # Line styles.
+        styles=[  # Line styles (one per ``impls`` entry).
             ("green", "--"),
-            ("orange", "--"),
             ("steelblue", "--"),
             ("red", "-"),
         ],
@@ -146,6 +147,10 @@ def attn_benchmark(seqlen, hd, wd, mask_type, attn_impl):
     assert b == 1, "for now, we only supports b=1 for ffa"
     is_attn_impl_support_this_mask = True
     already_known_oom_before_run = False
+    if attn_impl == "fa4-max-score" and (
+        "varlen" in mask_type or mask_type == "sliding_window_causal"
+    ):
+        is_attn_impl_support_this_mask = False
 
     # --------- prepare arguments --------- #
 
@@ -381,7 +386,7 @@ def attn_benchmark(seqlen, hd, wd, mask_type, attn_impl):
                 print(f"make varlen causal sdpa mask failed: {e}")
 
     # ffa style shape: (t,h,d)
-    if attn_impl in ("ffa", "ffa_fa4", "cudnn"):
+    if attn_impl in ("ffa", "ffa_fa4", "fa4-max-score", "cudnn"):
         q = q.view(b * sq, nhq, hd)
         k = k.view(b * sk, nhk, hd)
         v = v.view(b * sk, nhk, hd)
@@ -595,6 +600,46 @@ def attn_benchmark(seqlen, hd, wd, mask_type, attn_impl):
         if wd == "bwd":
             try:
                 o = fn()
+            except Exception as e:
+                if "CUDA out of memory" not in str(e):
+                    print(
+                        f"Error occured before running {attn_impl} with {mask_type} mask "
+                        f"when {seqlen=}, {hd=} during {wd}: {e=}"
+                    )
+                    raise e
+                already_known_oom_before_run = True
+
+            def fn():
+                o.backward(do, retain_graph=True)
+
+    elif attn_impl == "fa4-max-score":
+        _ = ffa_fa4_func(
+            q,
+            k,
+            v,
+            q_ranges=q_ranges,
+            k_ranges=k_ranges,
+            attn_type_map=attn_type_map,
+            reuse_attn_arg=False,
+            return_max_score=True,
+        )
+        torch.cuda.synchronize()
+
+        def fn():
+            return ffa_fa4_func(
+                q,
+                k,
+                v,
+                q_ranges=q_ranges,
+                k_ranges=k_ranges,
+                attn_type_map=attn_type_map,
+                reuse_attn_arg=True,
+                return_max_score=True,
+            )
+
+        if wd == "bwd":
+            try:
+                o, *rest = fn()
             except Exception as e:
                 if "CUDA out of memory" not in str(e):
                     print(

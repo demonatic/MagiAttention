@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import inspect
+from typing import Optional
 
 import torch
 
@@ -33,6 +34,26 @@ if is_fa4_installed:
     load_precompiled_ffa_fa4()
 
 
+def flash_attn_fwd_supports_max_score_out() -> bool:
+    """True if installed ``flash_attn_cute._flash_attn_fwd`` accepts ``max_score_out``."""
+    if not is_fa4_installed:
+        return False
+    return "max_score_out" in inspect.signature(_flash_attn_fwd).parameters
+
+
+def fa4_max_score_shape(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    *,
+    k_sparse_block_size: int = 128,
+) -> tuple[int, int, int, int]:
+    """Shape for ``max_score_out`` as passed to FA4 (with batch dim): ``(1, num_head, seqlen_q, n_k_chunks)``."""
+    seqlen_q, num_head = q.shape[0], q.shape[1]
+    seqlen_k = k.shape[0]
+    n_chunks = (seqlen_k + k_sparse_block_size - 1) // k_sparse_block_size
+    return (1, num_head, seqlen_q, n_chunks)
+
+
 @torch.no_grad()
 def fa4_fwd(
     q: torch.Tensor,
@@ -43,22 +64,41 @@ def fa4_fwd(
     softmax_scale: float | None = None,
     softcap: float = 0.0,
     sink_layout: AttnSinkLayout = "sh",
-) -> tuple[torch.Tensor, torch.Tensor]:
+    max_score_out: Optional[torch.Tensor] = None,
+    return_max_score: bool = False,
+    k_sparse_block_size: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     assert is_fa4_installed, "FlashAttn4 is not installed"
     assert isinstance(attn_arg, FA4AttnArg), "FA4 is only supported for FA4AttnArg"
 
+    want_max_score = return_max_score or max_score_out is not None
+    if want_max_score and not flash_attn_fwd_supports_max_score_out():
+        raise RuntimeError(
+            "return_max_score / max_score_out requires a FlashAttention cute build whose "
+            "_flash_attn_fwd accepts max_score_out (SM100 FA4 path)."
+        )
+
     # Get FA4 arguments
     fa4_args = attn_arg.to_fa4_args(is_bwd=False)
+    block_sparse = fa4_args["linear_k_block_sparse_mask"]
+
+    if return_max_score:
+        if max_score_out is not None:
+            raise ValueError("Pass only one of return_max_score and max_score_out")
+        shape_ms = fa4_max_score_shape(q, k, k_sparse_block_size=k_sparse_block_size)
+        max_score_out = torch.full(
+            shape_ms,
+            float("-inf"),
+            dtype=torch.float32,
+            device=q.device,
+        )
 
     # Rearrange q,k,v: (s, h, d) -> (1, s, h, d)
-    q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
-    out, lse = _flash_attn_fwd(
-        q,
-        k,
-        v,
+    q_b, k_b, v_b = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
+    fwd_kw: dict = dict(
         softmax_scale=softmax_scale,
         causal=False,
-        arbitrary=True,  # NOTE: to eanble arbitrary mask functionality
+        arbitrary=True,  # NOTE: to enable arbitrary mask functionality
         window_size_left=None,
         window_size_right=None,
         learnable_sink=sink,
@@ -67,16 +107,26 @@ def fa4_fwd(
         pack_gqa=False,
         mask_mod=None,
         return_lse=True,
-        block_sparse_tensors=fa4_args["linear_k_block_sparse_mask"],
+        block_sparse_tensors=block_sparse,
         aux_tensors=fa4_args["aux_tensors"],
     )
+    if max_score_out is not None:
+        fwd_kw["max_score_out"] = max_score_out
+        fwd_kw["k_sparse_block_size"] = k_sparse_block_size
+
+    out, lse = _flash_attn_fwd(q_b, k_b, v_b, **fwd_kw)
 
     # Rearrange out: (1, s, h, d) -> (s, h, d)
     out = out.squeeze(0)
     # Rearrange lse: (1, h, s) -> (s, h)
     lse = lse.squeeze(0).mT
 
-    return out, lse
+    max_score_sqh: Optional[torch.Tensor] = None
+    if max_score_out is not None:
+        # FA layout (B, H, S, C) with B=1 -> (S, H, C) to align seqlen_q with out[:, ...]
+        max_score_sqh = max_score_out.squeeze(0).permute(1, 0, 2).contiguous()
+
+    return out, lse, max_score_sqh
 
 
 @torch.no_grad()
@@ -150,6 +200,7 @@ class FA4AttnFunc(torch.autograd.Function):
         softmax_scale: float | None,
         softcap: float,
         reuse_attn_arg: bool = False,
+        return_max_score: bool = False,
     ):
         softmax_scale = (
             q.shape[-1] ** (-0.5) if softmax_scale is None else softmax_scale
@@ -183,7 +234,7 @@ class FA4AttnFunc(torch.autograd.Function):
             # Cache for future reuse
             FA4AttnFunc._cached_fa4_attn_arg = fa4_attn_arg
 
-        out, lse = fa4_fwd(
+        out, lse, max_sc = fa4_fwd(
             q=q,
             k=k,
             v=v,
@@ -191,6 +242,7 @@ class FA4AttnFunc(torch.autograd.Function):
             attn_arg=fa4_attn_arg,
             softmax_scale=softmax_scale,
             softcap=softcap,
+            return_max_score=return_max_score,
         )
 
         # Save for backward
@@ -198,12 +250,19 @@ class FA4AttnFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.softcap = softcap
         ctx.fa4_attn_arg = fa4_attn_arg
+        ctx.return_max_score = return_max_score
 
+        if return_max_score:
+            return out, lse, max_sc
         return out, lse
 
     @staticmethod
-    def backward(ctx, dout: torch.Tensor, *args):
+    def backward(ctx, *grad_outputs):
         q, k, v, out, lse, q_ranges, k_ranges, attn_type_map = ctx.saved_tensors
+        if ctx.return_max_score:
+            dout, dlse, _ = grad_outputs
+        else:
+            dout, dlse = grad_outputs
 
         # Call fa4_bwd
         dq, dk, dv, _ = fa4_bwd(
@@ -220,7 +279,7 @@ class FA4AttnFunc(torch.autograd.Function):
         )
 
         # Return gradients for each input (None for non-tensor args)
-        return dq, dk, dv, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None
 
 
 def ffa_fa4_func(
@@ -234,7 +293,8 @@ def ffa_fa4_func(
     softmax_scale: float | None = None,
     softcap: float = 0.0,
     reuse_attn_arg: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_max_score: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     FA4 backend version of flex_flash_attn_func for benchmarking.
 
@@ -253,9 +313,12 @@ def ffa_fa4_func(
         reuse_attn_arg (bool): If True, reuse the cached FA4AttnArg from previous call.
             Set to False for warmup/first call, then True for subsequent calls
             to measure only kernel time without FA4AttnArg creation overhead.
+        return_max_score (bool): If True, also return per-(q,h) max logits per K-block (see ``fa4_fwd``).
+            Works together with FA4 ``block_sparse_tensors``; unvisited K-blocks stay ``-inf``.
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor]: (out, lse)
+        (out, lse) or (out, lse, max_score) with ``max_score`` shape
+        ``(seqlen_q, num_heads, ceil(seqlen_k / 128))`` when ``return_max_score`` is True.
     """
     return FA4AttnFunc.apply(
         q,
@@ -267,4 +330,5 @@ def ffa_fa4_func(
         softmax_scale,
         softcap,
         reuse_attn_arg,
+        return_max_score,
     )
