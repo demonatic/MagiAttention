@@ -56,15 +56,19 @@ from magi_attention.common.range import AttnRange
 from magi_attention.common.ranges import AttnRanges
 from magi_attention.utils._utils import make_attn_mask_from_ffa_args
 
+try:
+    from flash_attn.cute.interface import _flash_attn_fwd
+except ImportError:
+    _flash_attn_fwd = None  # type: ignore[misc, assignment]
+
 # impls = ["ffa", "fa3", "fa4", "cudnn", "fa2", "flex", "sdpa"]  # all except torch native
 # impls = ["cudnn", "fa4", "ffa_fa4"] # for blackwell
-# ``fa4-max-score``: same as ``ffa_fa4`` but ``return_max_score=True`` (SM10 + flash_attn_cute w/ max_score_out).
-# Minimal set for SM100 + mounted flash-attention: ``fa4`` (cute), ``ffa_fa4`` / ``fa4-max-score`` (Magi). Add fa3/cudnn/ffa on your machine as needed.
-impls = ["fa4", "ffa_fa4", "fa4-max-score"]
+# ``fa4-max-score``: ``return_max_score=True`` (softmax warp fmax→smem, correction warp smem→gmem).
+impls = ["fa4", "fa4-max-score"]
 
-mask_types = ["full"]
+# Dense square ``full`` vs padding varlen ``varlen_full`` (same ``ss`` x-axis = target total seqlen).
+mask_types = ["full", "varlen_full"]
 # mask_types = ["causal"]
-# mask_types = ["varlen_full"]
 # mask_types = ["varlen_causal"]
 # mask_types = ["sliding_window_causal"]
 # mask_types = ["varlen_block_causal"]
@@ -122,7 +126,6 @@ attn_flops_configs = [
         line_names=impls,  # Label name for the lines.
         styles=[  # Line styles (one per ``impls`` entry).
             ("green", "--"),
-            ("steelblue", "--"),
             ("red", "-"),
         ],
         ylabel={  # Label name for the y-axis.
@@ -147,9 +150,7 @@ def attn_benchmark(seqlen, hd, wd, mask_type, attn_impl):
     assert b == 1, "for now, we only supports b=1 for ffa"
     is_attn_impl_support_this_mask = True
     already_known_oom_before_run = False
-    if attn_impl == "fa4-max-score" and (
-        "varlen" in mask_type or mask_type == "sliding_window_causal"
-    ):
+    if attn_impl == "fa4-max-score" and mask_type == "sliding_window_causal":
         is_attn_impl_support_this_mask = False
 
     # --------- prepare arguments --------- #
@@ -386,7 +387,7 @@ def attn_benchmark(seqlen, hd, wd, mask_type, attn_impl):
                 print(f"make varlen causal sdpa mask failed: {e}")
 
     # ffa style shape: (t,h,d)
-    if attn_impl in ("ffa", "ffa_fa4", "fa4-max-score", "cudnn"):
+    if attn_impl in ("ffa", "ffa_fa4", "cudnn"):
         q = q.view(b * sq, nhq, hd)
         k = k.view(b * sk, nhk, hd)
         v = v.view(b * sk, nhk, hd)
@@ -398,7 +399,7 @@ def attn_benchmark(seqlen, hd, wd, mask_type, attn_impl):
     # fa style shape:
     #   non-varlen: (b,s,h,d)
     #   varlen: (t,h,d)
-    if attn_impl in ("fa2", "fa3", "fa4"):
+    if attn_impl in ("fa2", "fa3", "fa4", "fa4-max-score"):
         if "varlen" in mask_type:
             q = q.view(b * sq, nhq, hd)
             k = k.view(b * sk, nhk, hd)
@@ -407,7 +408,7 @@ def attn_benchmark(seqlen, hd, wd, mask_type, attn_impl):
         if "block_causal" in mask_type:
             is_attn_impl_support_this_mask = False
 
-        if attn_impl == "fa4":
+        if attn_impl in ("fa4", "fa4-max-score"):
             window_size_tuple = tuple(
                 [None if x == -1 else x for x in window_size_tuple]
             )
@@ -613,33 +614,105 @@ def attn_benchmark(seqlen, hd, wd, mask_type, attn_impl):
                 o.backward(do, retain_graph=True)
 
     elif attn_impl == "fa4-max-score":
-        _ = ffa_fa4_func(
-            q,
-            k,
-            v,
-            q_ranges=q_ranges,
-            k_ranges=k_ranges,
-            attn_type_map=attn_type_map,
-            reuse_attn_arg=False,
-            return_max_score=True,
-        )
+        # ``max_score_out`` enables per-K-block fmax in cute forward (SM100; smem-only write).
+        if _flash_attn_fwd is None:
+            raise RuntimeError("fa4-max-score requires flash_attn.cute.interface._flash_attn_fwd")
+        ws = window_size_tuple
+
+        if "varlen" in mask_type:
+            total_q_tok = q.shape[0]
+            total_k_tok = k.shape[0]
+            num_k_chunks = (total_k_tok + 127) // 128
+            max_score_buf = torch.full(
+                (nhq, total_q_tok, num_k_chunks),
+                float("-inf"),
+                dtype=torch.float32,
+                device=device,
+            )
+
+            def _fwd_max_score():
+                return _flash_attn_fwd(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                    arbitrary=False,
+                    window_size_left=ws[0],
+                    window_size_right=ws[1],
+                    learnable_sink=None,
+                    softcap=0.0,
+                    num_splits=1,
+                    pack_gqa=None,
+                    mask_mod=None,
+                    block_sparse_tensors=None,
+                    aux_tensors=None,
+                    return_lse=False,
+                    max_score_out=max_score_buf,
+                    k_sparse_block_size=128,
+                )[0]
+        else:
+            num_k_chunks = (sk + 127) // 128
+            max_score_buf = torch.full(
+                (b, nhq, sq, num_k_chunks),
+                float("-inf"),
+                dtype=torch.float32,
+                device=device,
+            )
+
+            def _fwd_max_score():
+                return _flash_attn_fwd(
+                    q,
+                    k,
+                    v,
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                    arbitrary=False,
+                    window_size_left=ws[0],
+                    window_size_right=ws[1],
+                    learnable_sink=None,
+                    softcap=0.0,
+                    num_splits=1,
+                    pack_gqa=None,
+                    mask_mod=None,
+                    block_sparse_tensors=None,
+                    aux_tensors=None,
+                    return_lse=False,
+                    max_score_out=max_score_buf,
+                    k_sparse_block_size=128,
+                )[0]
+
+        _ = _fwd_max_score()
         torch.cuda.synchronize()
 
         def fn():
-            return ffa_fa4_func(
-                q,
-                k,
-                v,
-                q_ranges=q_ranges,
-                k_ranges=k_ranges,
-                attn_type_map=attn_type_map,
-                reuse_attn_arg=True,
-                return_max_score=True,
-            )
+            return _fwd_max_score()
 
         if wd == "bwd":
+            # Backward does not use max-score; same kernel as ``fa4`` bwd.
             try:
-                o, *rest = fn()
+                if "varlen" in mask_type:
+                    o = fa4_varlen_func(
+                        q,
+                        k,
+                        v,
+                        cu_seqlens_q,
+                        cu_seqlens_k,
+                        softmax_scale=softmax_scale,
+                        causal=causal,
+                        window_size=ws,
+                    )[0]
+                else:
+                    o = fa4_func(
+                        q,
+                        k,
+                        v,
+                        softmax_scale=softmax_scale,
+                        causal=causal,
+                        window_size=ws,
+                    )[0]
             except Exception as e:
                 if "CUDA out of memory" not in str(e):
                     print(

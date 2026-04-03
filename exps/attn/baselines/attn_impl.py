@@ -19,7 +19,6 @@ import torch
 from packaging import version
 from torch.nn.attention.flex_attention import flex_attention
 from torch.nn.functional import scaled_dot_product_attention as sdpa_func
-from transformer_engine.pytorch.cpp_extensions.fused_attn import FusedAttnBackend
 
 from magi_attention.functional import ffa_fa4_func
 from magi_attention.functional import flex_flash_attn_func as ffa_func
@@ -53,17 +52,20 @@ except ImportError:
     )
 
 try:
+    from transformer_engine.pytorch.cpp_extensions.fused_attn import FusedAttnBackend
     import transformer_engine as te
     from transformer_engine.pytorch.attention.dot_product_attention.backends import (
         FusedAttnFunc,
     )
 
     te_2_9_0 = version.parse(te.__version__) >= version.parse("2.9.0")
-except ImportError:
+except (ImportError, RuntimeError, OSError):
+    FusedAttnBackend = None  # type: ignore[misc, assignment]
     FusedAttnFunc = missing_dependency(
         dep_name="transformer_engine",
         func_name="FusedAttnFunc",
     )
+    te_2_9_0 = False
 
 try:
     from paddle.nn.functional.flash_attention import (
@@ -169,6 +171,10 @@ def cudnn_fused_attn_func(
     qkv_layout = "thd_thd_thd"
     softmax_type = "vanilla"
 
+    if FusedAttnBackend is None:
+        raise RuntimeError(
+            "cudnn_fused_attn_func requires transformer_engine with cuDNN libraries available."
+        )
     fast_zero_fill = True
     softmax_scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
     fused_attention_backend = FusedAttnBackend["F16_arbitrary_seqlen"]

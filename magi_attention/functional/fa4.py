@@ -123,7 +123,7 @@ def fa4_fwd(
 
     max_score_sqh: Optional[torch.Tensor] = None
     if max_score_out is not None:
-        # FA layout (B, H, S, C) with B=1 -> (S, H, C) to align seqlen_q with out[:, ...]
+        # FA layout (B, H, S, C) with B=1 -> (S, H, C). Kernel does not write this buffer (smem-only).
         max_score_sqh = max_score_out.squeeze(0).permute(1, 0, 2).contiguous()
 
     return out, lse, max_score_sqh
@@ -313,8 +313,9 @@ def ffa_fa4_func(
         reuse_attn_arg (bool): If True, reuse the cached FA4AttnArg from previous call.
             Set to False for warmup/first call, then True for subsequent calls
             to measure only kernel time without FA4AttnArg creation overhead.
-        return_max_score (bool): If True, also return per-(q,h) max logits per K-block (see ``fa4_fwd``).
-            Works together with FA4 ``block_sparse_tensors``; unvisited K-blocks stay ``-inf``.
+        return_max_score (bool): If True, enables the extra per-K-block max reduction in the FA4 kernel
+            (SM100); maxima live in shared memory only—the returned ``max_score`` tensor is **not**
+            filled and keeps its ``-inf`` initialization.
 
     Returns:
         (out, lse) or (out, lse, max_score) with ``max_score`` shape
