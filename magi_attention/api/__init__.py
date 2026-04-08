@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from magi_attention.common import CalcAttnCustomAttribute
 from magi_attention.common.enum import AttnMaskType, AttnOverlapMode
 from magi_attention.common.ranges import AttnRanges
 from magi_attention.config import DistAttnConfig
@@ -47,6 +48,7 @@ from .magi_attn_interface import (
 )
 
 __all__ = [
+    "CalcAttnCustomAttribute",
     "calc_attn",
     "dispatch",
     "magi_attn_flex_dispatch",

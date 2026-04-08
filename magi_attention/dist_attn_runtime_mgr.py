@@ -23,7 +23,7 @@ from torch.distributed.device_mesh import DeviceMesh
 
 import magi_attention
 from magi_attention.comm.primitive.grpcoll._mgr import grpcoll_buffer_mgr
-from magi_attention.common import AttnForwardMeta, AttnRanges
+from magi_attention.common import AttnForwardMeta, AttnRanges, CalcAttnCustomAttribute
 from magi_attention.common.enum import AttnMaskType, AttnRole
 from magi_attention.config import (
     DispatchConfig,
@@ -156,6 +156,7 @@ class DistAttnRuntimeMgr:
         softmax_scale: float | None = None,
         softcap: float = 0.0,
         return_max_logits: bool = False,
+        custom_attribute: CalcAttnCustomAttribute | None = None,
     ) -> tuple[torch.Tensor, AttnForwardMeta]:
         return dist_attn_func(
             q=q,
@@ -166,6 +167,7 @@ class DistAttnRuntimeMgr:
             softmax_scale=softmax_scale,
             softcap=softcap,
             return_max_logits=return_max_logits,
+            custom_attribute=custom_attribute,
         )
 
     def get_xattn_args(

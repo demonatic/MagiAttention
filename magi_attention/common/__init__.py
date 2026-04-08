@@ -27,7 +27,7 @@ def is_cpp_backend_enable() -> bool:
 
 
 from . import enum, jit, range_op  # noqa: E402
-from .forward_meta import AttnForwardMeta  # noqa: E402
+from .forward_meta import AttnForwardMeta, CalcAttnCustomAttribute  # noqa: E402
 from .mask import AttnMask  # noqa: E402
 from .range import AttnRange, RangeError  # noqa: E402
 from .ranges import AttnRanges  # noqa: E402
@@ -57,6 +57,7 @@ __all__ = [
     "RangeError",
     "AttnRanges",
     "AttnForwardMeta",
+    "CalcAttnCustomAttribute",
     "AttnRectangle",
     "AttnRectangles",
     "range_op",

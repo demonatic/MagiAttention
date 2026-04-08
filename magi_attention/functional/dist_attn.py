@@ -26,7 +26,7 @@ from torch.distributed import ReduceOp
 import magi_attention
 from magi_attention.comm.primitive.grpcoll import group_cast, group_reduce
 from magi_attention.comm.work import GeneralWork, WorkWithPostProcessFn
-from magi_attention.common import AttnForwardMeta
+from magi_attention.common import AttnForwardMeta, CalcAttnCustomAttribute
 from magi_attention.common.enum import GrpCollBufferName
 from magi_attention.meta.collection import CalcMeta, CommMeta
 from magi_attention.meta.collection.calc_meta import AttnArg
@@ -36,6 +36,41 @@ from .fa4 import fa4_bwd, fa4_fwd
 from .flex_flash_attn import _flex_flash_attn_backward, _flex_flash_attn_forward
 from .sdpa import sdpa_bwd, sdpa_fwd
 from .utils import calc_lse_sink_compiled, correct_attn_out_lse, sink_bwd_compiled
+
+
+def _validate_calc_attn_custom_attribute(
+    dist_attn_runtime: "DistAttnRuntime",
+    custom_attribute: CalcAttnCustomAttribute | None,
+    return_max_logits: bool,
+) -> None:
+    if custom_attribute is None:
+        return
+    want_blocks = (
+        custom_attribute.return_block_max or custom_attribute.return_block_lse
+    )
+    if not want_blocks:
+        return
+    if return_max_logits:
+        raise ValueError(
+            "return_max_logits=True is incompatible with return_block_max / "
+            "return_block_lse in CalcAttnCustomAttribute."
+        )
+    if magi_attention.is_flatten_head_groups_enable():
+        raise ValueError(
+            "Flattening head groups is incompatible with return_block_max / "
+            "return_block_lse in CalcAttnCustomAttribute."
+        )
+    if not dist_attn_runtime.use_fa4_backend:
+        raise ValueError(
+            "return_block_max / return_block_lse require FA4 backend "
+            "(dist_attn_runtime.use_fa4_backend)."
+        )
+    if dist_attn_runtime.overlap_degree != 0:
+        raise NotImplementedError(
+            "return_block_max / return_block_lse are only supported when "
+            f"overlap_degree == 0 (got {dist_attn_runtime.overlap_degree=})."
+        )
+
 
 is_magi_attn_ext_installed = False
 try:
@@ -193,6 +228,7 @@ class DistAttnRuntime:
         softcap: float = 0.0,
         sink: torch.Tensor | None = None,
         return_max_logits: bool = False,
+        custom_attribute: CalcAttnCustomAttribute | None = None,
     ) -> tuple[torch.Tensor | None, AttnForwardMeta | None]:
         """
         Apply forward partial attention with given q,kv for the given overlap stage
@@ -235,6 +271,12 @@ class DistAttnRuntime:
             assert (
                 return_max_logits is False
             ), "Flattening head groups is incompatible with return_max_logits"
+            assert custom_attribute is None or not (
+                custom_attribute.return_block_max or custom_attribute.return_block_lse
+            ), (
+                "Flattening head groups is incompatible with return_block_max / "
+                "return_block_lse"
+            )
 
         # fetch attn arg
         if is_host_stage:
@@ -255,7 +297,10 @@ class DistAttnRuntime:
                     return_max_logits=return_max_logits,
                 )
                 return partial_out, AttnForwardMeta(
-                    lse=partial_lse, max_logits=partial_max_logits
+                    lse=partial_lse,
+                    max_logits=partial_max_logits,
+                    block_max=None,
+                    block_lse=None,
                 )
             return None, None
 
@@ -277,6 +322,7 @@ class DistAttnRuntime:
             softcap=softcap,
             is_host_stage=is_host_stage,
             return_max_logits=return_max_logits,
+            custom_attribute=custom_attribute,
         )
 
         # maybe downcast out to q dtype for the host stage
@@ -1170,6 +1216,7 @@ class DistAttnRuntime:
         softcap: float,
         is_host_stage: bool,
         return_max_logits: bool = False,
+        custom_attribute: CalcAttnCustomAttribute | None = None,
     ) -> tuple[torch.Tensor, AttnForwardMeta]:
         if return_max_logits:
             assert (
@@ -1200,7 +1247,14 @@ class DistAttnRuntime:
                     torch.maximum(max_logits_acc, meta.max_logits, out=max_logits_acc)
                     meta.max_logits = max_logits_acc
             elif self.use_fa4_backend:
-                partial_out, partial_lse, _ = fa4_fwd(
+                k_blk = (
+                    custom_attribute.k_sparse_block_size
+                    if custom_attribute is not None
+                    else 128
+                )
+                want_bm = custom_attribute is not None and custom_attribute.return_block_max
+                want_bl = custom_attribute is not None and custom_attribute.return_block_lse
+                partial_out, partial_lse, max_sc, blk_lse = fa4_fwd(
                     q=q,
                     k=k,
                     v=v,
@@ -1211,8 +1265,16 @@ class DistAttnRuntime:
                     softmax_scale=softmax_scale,
                     softcap=softcap,
                     sink_layout="sh",
+                    return_max_score=want_bm,
+                    return_block_lse=want_bl,
+                    k_sparse_block_size=k_blk,
                 )
-                meta = AttnForwardMeta(lse=partial_lse, max_logits=None)
+                meta = AttnForwardMeta(
+                    lse=partial_lse,
+                    max_logits=None,
+                    block_max=max_sc,
+                    block_lse=blk_lse,
+                )
             else:
                 partial_out, meta = _flex_flash_attn_forward(
                     q=q,
@@ -2581,6 +2643,7 @@ class DistAttnRuntime:
             None,  # softmax_scale
             None,  # softcap
             None,  # return_max_logits
+            None,  # custom_attribute
         )
 
     def _compute_grpcoll_bytes(
@@ -2890,7 +2953,14 @@ class DistAttnFunc(torch.autograd.Function):
         softmax_scale: float | None = None,
         softcap: float = 0.0,
         return_max_logits: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        custom_attribute: CalcAttnCustomAttribute | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         """
         Distributed Attention forward function
 
@@ -2923,6 +2993,10 @@ class DistAttnFunc(torch.autograd.Function):
             local_lse: [num_tokens_q_local, num_heads_q]
             local_max_logits: [num_heads_q] when return_max_logits is True
         """
+        _validate_calc_attn_custom_attribute(
+            dist_attn_runtime, custom_attribute, return_max_logits
+        )
+
         # init kernel barrier for native grpcoll to ensure comm kernel is always preceded by compute kernel
         kernel_barrier_fetch = KernelBarrier(
             dist_attn_runtime.fwd_kernel_barrier_fetch_target
@@ -2951,10 +3025,13 @@ class DistAttnFunc(torch.autograd.Function):
             softcap=softcap,
             sink=global_sink,
             return_max_logits=return_max_logits,
+            custom_attribute=custom_attribute,
         )
         assert partial_local_out is not None and partial_local_meta is not None
         partial_local_lse = partial_local_meta.lse
         partial_local_max_logits = partial_local_meta.max_logits
+        local_block_max = partial_local_meta.block_max
+        local_block_lse = partial_local_meta.block_lse
 
         # loop into remote stages
         for ith_overlap_stage in range(dist_attn_runtime.overlap_degree):
@@ -3008,6 +3085,7 @@ class DistAttnFunc(torch.autograd.Function):
                 softcap=softcap,
                 sink=global_sink,
                 return_max_logits=return_max_logits,
+                custom_attribute=custom_attribute,
             )
             partial_remote_lse = (
                 partial_remote_meta.lse if partial_remote_meta is not None else None
@@ -3064,7 +3142,13 @@ class DistAttnFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.softcap = softcap
 
-        return local_out, local_lse, local_max_logits
+        return (
+            local_out,
+            local_lse,
+            local_max_logits,
+            local_block_max,
+            local_block_lse,
+        )
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor, *args):  # pragma: no cover
@@ -3215,6 +3299,7 @@ class DistAttnFunc(torch.autograd.Function):
             None,  # softmax_scale
             None,  # softcap
             None,  # return_max_logits
+            None,  # custom_attribute
         )
 
 
@@ -3227,6 +3312,7 @@ def dist_attn_func(
     softmax_scale: float | None = None,
     softcap: float = 0.0,
     return_max_logits: bool = False,
+    custom_attribute: CalcAttnCustomAttribute | None = None,
 ) -> tuple[torch.Tensor, AttnForwardMeta]:
     """Distributed attention autograd function
 
@@ -3248,6 +3334,8 @@ def dist_attn_func(
         return_max_logits (bool, optional): whether to compute and return max_logits
             (per head, shape [num_heads_q], all-reduced MAX across all ranks).
             Defaults to ``False``.
+        custom_attribute (CalcAttnCustomAttribute, optional): optional FA4-only flags such as
+            ``return_block_max`` / ``return_block_lse`` (requires ``overlap_degree == 0``).
 
     Returns:
         out (torch.Tensor): local out tensor
@@ -3262,7 +3350,7 @@ def dist_attn_func(
         lse: [num_tokens_q_local, num_heads_q]
         meta.max_logits: [num_heads_q] when return_max_logits is True
     """
-    out, lse, max_logits = DistAttnFunc.apply(
+    out, lse, max_logits, block_max, block_lse = DistAttnFunc.apply(
         q,
         k,
         v,
@@ -3271,5 +3359,11 @@ def dist_attn_func(
         softmax_scale,
         softcap,
         return_max_logits,
+        custom_attribute,
     )
-    return out, AttnForwardMeta(lse=lse, max_logits=max_logits)
+    return out, AttnForwardMeta(
+        lse=lse,
+        max_logits=max_logits,
+        block_max=block_max,
+        block_lse=block_lse,
+    )

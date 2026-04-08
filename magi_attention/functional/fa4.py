@@ -41,6 +41,13 @@ def flash_attn_fwd_supports_max_score_out() -> bool:
     return "max_score_out" in inspect.signature(_flash_attn_fwd).parameters
 
 
+def flash_attn_fwd_supports_block_lse_out() -> bool:
+    """True if installed ``flash_attn_cute._flash_attn_fwd`` accepts ``block_lse_out``."""
+    if not is_fa4_installed:
+        return False
+    return "block_lse_out" in inspect.signature(_flash_attn_fwd).parameters
+
+
 def fa4_max_score_shape(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -66,8 +73,10 @@ def fa4_fwd(
     sink_layout: AttnSinkLayout = "sh",
     max_score_out: Optional[torch.Tensor] = None,
     return_max_score: bool = False,
+    block_lse_out: Optional[torch.Tensor] = None,
+    return_block_lse: bool = False,
     k_sparse_block_size: int = 128,
-) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     assert is_fa4_installed, "FlashAttn4 is not installed"
     assert isinstance(attn_arg, FA4AttnArg), "FA4 is only supported for FA4AttnArg"
 
@@ -76,6 +85,13 @@ def fa4_fwd(
         raise RuntimeError(
             "return_max_score / max_score_out requires a FlashAttention cute build whose "
             "_flash_attn_fwd accepts max_score_out (SM100 FA4 path)."
+        )
+
+    want_block_lse = return_block_lse or block_lse_out is not None
+    if want_block_lse and not flash_attn_fwd_supports_block_lse_out():
+        raise RuntimeError(
+            "return_block_lse / block_lse_out requires a FlashAttention cute build whose "
+            "_flash_attn_fwd accepts block_lse_out (SM100 FA4 path)."
         )
 
     # Get FA4 arguments
@@ -88,6 +104,17 @@ def fa4_fwd(
         shape_ms = fa4_max_score_shape(q, k, k_sparse_block_size=k_sparse_block_size)
         max_score_out = torch.full(
             shape_ms,
+            float("-inf"),
+            dtype=torch.float32,
+            device=q.device,
+        )
+
+    if return_block_lse:
+        if block_lse_out is not None:
+            raise ValueError("Pass only one of return_block_lse and block_lse_out")
+        shape_bl = fa4_max_score_shape(q, k, k_sparse_block_size=k_sparse_block_size)
+        block_lse_out = torch.full(
+            shape_bl,
             float("-inf"),
             dtype=torch.float32,
             device=q.device,
@@ -113,6 +140,9 @@ def fa4_fwd(
     if max_score_out is not None:
         fwd_kw["max_score_out"] = max_score_out
         fwd_kw["k_sparse_block_size"] = k_sparse_block_size
+    if block_lse_out is not None:
+        fwd_kw["block_lse_out"] = block_lse_out
+        fwd_kw["k_sparse_block_size"] = k_sparse_block_size
 
     out, lse = _flash_attn_fwd(q_b, k_b, v_b, **fwd_kw)
 
@@ -126,7 +156,11 @@ def fa4_fwd(
         # FA layout (B, H, S, C) with B=1 -> (S, H, C). Kernel does not write this buffer (smem-only).
         max_score_sqh = max_score_out.squeeze(0).permute(1, 0, 2).contiguous()
 
-    return out, lse, max_score_sqh
+    block_lse_sqh: Optional[torch.Tensor] = None
+    if block_lse_out is not None:
+        block_lse_sqh = block_lse_out.squeeze(0).permute(1, 0, 2).contiguous()
+
+    return out, lse, max_score_sqh, block_lse_sqh
 
 
 @torch.no_grad()
@@ -234,7 +268,7 @@ class FA4AttnFunc(torch.autograd.Function):
             # Cache for future reuse
             FA4AttnFunc._cached_fa4_attn_arg = fa4_attn_arg
 
-        out, lse, max_sc = fa4_fwd(
+        out, lse, max_sc, _block_lse = fa4_fwd(
             q=q,
             k=k,
             v=v,

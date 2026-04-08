@@ -14,4 +14,9 @@
 
 export CUDA_VISIBLE_DEVICES=0
 
-PYTHONPATH=. python run_benchmark.py
+# exps.* imports require MagiAttention repo root on PYTHONPATH (not exps/attn).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+cd "$SCRIPT_DIR"
+python run_benchmark.py

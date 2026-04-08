@@ -23,6 +23,7 @@ from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_utils import run_tests
 
 import magi_attention
+from magi_attention.common import CalcAttnCustomAttribute
 from magi_attention.api.functools import (
     apply_padding,
     compute_pad_size,
@@ -54,6 +55,7 @@ from magi_attention.dist_attn_runtime_mgr import (
     DistAttnRuntimeMgr,
     init_dist_attn_runtime_mgr,
 )
+from magi_attention.meta.collection.calc_meta import is_magi_to_hstu_installed
 from magi_attention.testing import parameterize
 from magi_attention.testing.dist_common import (
     INTERFACE,
@@ -74,6 +76,13 @@ from magi_attention.utils import (
     get_calc_cost_factor,
     get_comm_cost_factor,
     is_list_value_all,
+)
+
+# FA4 ``calc_attn`` / block meta tests need ``magi_to_hstu_cuda`` (mask -> HSTU for FA4 kernels).
+# Build from flash-attention: ``cd csrc/utils/magi_to_hstu && pip install .`` (see that ``setup.py``).
+_FA4_BLOCK_META_SKIP_NO_MAGI_TO_HSTU = (
+    "magi_to_hstu_cuda is not installed (required for FA4AttnArg / FA4 calc_attn). "
+    "Install from flash-attention: cd <flash-attention>/csrc/utils/magi_to_hstu && pip install ."
 )
 
 
@@ -752,6 +761,160 @@ class TestInterfaceBaseWithWorldSize1(DistTestBase):
                 new_mgr == ref_new_mgr
             ), f"For {test_case=}, the {new_mgr=} is not equal to the {ref_new_mgr=}."
 
+    @skip_if_lt_x_gpu(1)
+    @with_comms
+    def test_calc_attn_custom_attribute_fa4_block_shapes(self):
+        if not magi_attention.is_fa4_backend_enable():
+            self.skipTest("FA4 backend not enabled")
+        from magi_attention.functional import fa4 as fa4_mod
+
+        if not fa4_mod.is_fa4_installed:
+            self.skipTest("flash_attn not installed")
+        if not fa4_mod.flash_attn_fwd_supports_max_score_out():
+            self.skipTest("FA build lacks max_score_out")
+        if not fa4_mod.flash_attn_fwd_supports_block_lse_out():
+            self.skipTest("FA build lacks block_lse_out")
+        if not is_magi_to_hstu_installed:
+            self.skipTest(_FA4_BLOCK_META_SKIP_NO_MAGI_TO_HSTU)
+
+        total_seqlen = 256
+        num_heads_q, num_heads_kv = 4, 4
+        head_dim = 64
+        dtype = torch.bfloat16
+        chunk_size = 256
+        q_ranges = AttnRanges.from_ranges([[0, total_seqlen]])
+        k_ranges = AttnRanges.from_ranges([[0, total_seqlen]])
+        pad_size = compute_pad_size(total_seqlen, self.world_size, chunk_size)
+        dist_attn_config = DistAttnConfig(
+            dispatch_config=DispatchConfig(alg=MinHeapDispatchAlg()),
+            overlap_config=OverlapConfig(
+                alg=UniformOverlapAlg(),
+                calc_cost_factor=get_calc_cost_factor(
+                    num_heads_q=num_heads_q,
+                    head_dim=head_dim,
+                    tflops=H100_TFLOPS_16,
+                    mfu=H100_MATMUL_MFU,
+                ),
+                comm_cost_factor=get_comm_cost_factor(
+                    num_heads_kv=num_heads_kv,
+                    head_dim=head_dim,
+                    bandwidth=H100_NVLINK_BANDWIDTH,
+                    bwu=H100_NVLINK_A2A_BWU,
+                    corr_factor=get_a2a_corr_factor(self.world_size),
+                ),
+            ),
+        )
+        key = magi_attn_flex_key(
+            q_ranges=q_ranges,
+            k_ranges=k_ranges,
+            attn_mask_type=[AttnMaskType.FULL],
+            total_seqlen_q=total_seqlen,
+            total_seqlen_k=total_seqlen,
+            num_heads_q=num_heads_q,
+            num_heads_kv=num_heads_kv,
+            head_dim=head_dim,
+            pad_size=pad_size,
+            chunk_size=chunk_size,
+            cp_group_or_mesh=self.device_mesh
+            if magi_attention.comm.is_hierarchical_comm_enable()
+            else self.nccl_group,
+            dist_attn_config=dist_attn_config,
+        )
+        mgr = dist_attn_runtime_dict_mgr[key]
+        assert mgr.dist_attn_runtime.overlap_degree == 0
+
+        x = torch.randn(total_seqlen, head_dim, device=self.device, dtype=dtype)
+        local_x = dispatch(x, key=key)
+        sq = local_x.shape[0]
+        local_q = torch.randn(sq, num_heads_q, head_dim, device=self.device, dtype=dtype)
+        local_k = torch.randn(sq, num_heads_kv, head_dim, device=self.device, dtype=dtype)
+        local_v = torch.randn(sq, num_heads_kv, head_dim, device=self.device, dtype=dtype)
+        custom = CalcAttnCustomAttribute(
+            return_block_max=True,
+            return_block_lse=True,
+            k_sparse_block_size=128,
+        )
+        _, meta = calc_attn(
+            local_q,
+            local_k,
+            local_v,
+            key,
+            custom_attribute=custom,
+        )
+        n_chunks = (sq + 127) // 128
+        assert meta.block_max is not None
+        assert meta.block_lse is not None
+        assert meta.block_max.shape == (sq, num_heads_q, n_chunks)
+        assert meta.block_lse.shape == (sq, num_heads_q, n_chunks)
+        assert meta.block_max.dtype == torch.float32
+        assert meta.block_lse.dtype == torch.float32
+
+        print(f"block max: {meta.block_max} block lse: {meta.block_lse}")
+
+    @skip_if_lt_x_gpu(1)
+    @with_comms
+    def test_calc_attn_custom_attribute_non_fa4_raises(self):
+        if magi_attention.is_fa4_backend_enable():
+            self.skipTest("non-FA4 backend only")
+
+        total_seqlen = 128
+        num_heads_q, num_heads_kv = 4, 4
+        head_dim = 64
+        dtype = torch.bfloat16
+        chunk_size = 128
+        q_ranges = AttnRanges.from_ranges([[0, total_seqlen]])
+        k_ranges = AttnRanges.from_ranges([[0, total_seqlen]])
+        pad_size = compute_pad_size(total_seqlen, self.world_size, chunk_size)
+        dist_attn_config = DistAttnConfig(
+            dispatch_config=DispatchConfig(alg=MinHeapDispatchAlg()),
+            overlap_config=OverlapConfig(
+                alg=UniformOverlapAlg(),
+                calc_cost_factor=get_calc_cost_factor(
+                    num_heads_q=num_heads_q,
+                    head_dim=head_dim,
+                    tflops=H100_TFLOPS_16,
+                    mfu=H100_MATMUL_MFU,
+                ),
+                comm_cost_factor=get_comm_cost_factor(
+                    num_heads_kv=num_heads_kv,
+                    head_dim=head_dim,
+                    bandwidth=H100_NVLINK_BANDWIDTH,
+                    bwu=H100_NVLINK_A2A_BWU,
+                    corr_factor=get_a2a_corr_factor(self.world_size),
+                ),
+            ),
+        )
+        key = magi_attn_flex_key(
+            q_ranges=q_ranges,
+            k_ranges=k_ranges,
+            attn_mask_type=[AttnMaskType.FULL],
+            total_seqlen_q=total_seqlen,
+            total_seqlen_k=total_seqlen,
+            num_heads_q=num_heads_q,
+            num_heads_kv=num_heads_kv,
+            head_dim=head_dim,
+            pad_size=pad_size,
+            chunk_size=chunk_size,
+            cp_group_or_mesh=self.device_mesh
+            if magi_attention.comm.is_hierarchical_comm_enable()
+            else self.nccl_group,
+            dist_attn_config=dist_attn_config,
+        )
+        x = torch.randn(total_seqlen, head_dim, device=self.device, dtype=dtype)
+        local_x = dispatch(x, key=key)
+        sq = local_x.shape[0]
+        local_q = torch.randn(sq, num_heads_q, head_dim, device=self.device, dtype=dtype)
+        local_k = torch.randn(sq, num_heads_kv, head_dim, device=self.device, dtype=dtype)
+        local_v = torch.randn(sq, num_heads_kv, head_dim, device=self.device, dtype=dtype)
+        with pytest.raises(ValueError, match="FA4"):
+            calc_attn(
+                local_q,
+                local_k,
+                local_v,
+                key,
+                custom_attribute=CalcAttnCustomAttribute(return_block_lse=True),
+            )
+
 
 class TestInterfaceWithWorldSize2(TestInterfaceBaseWithWorldSize1):
     @property
@@ -761,6 +924,82 @@ class TestInterfaceWithWorldSize2(TestInterfaceBaseWithWorldSize1):
     @skip_if_lt_x_gpu(2)
     def test_interface(self, *args, **kwargs):
         super().test_interface(*args, **kwargs)
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_calc_attn_custom_attribute_overlap_raises(self):
+        if not magi_attention.is_fa4_backend_enable():
+            self.skipTest("FA4 backend not enabled")
+        from magi_attention.functional import fa4 as fa4_mod
+
+        if not fa4_mod.is_fa4_installed:
+            self.skipTest("flash_attn not installed")
+        if not fa4_mod.flash_attn_fwd_supports_block_lse_out():
+            self.skipTest("FA build lacks block_lse_out")
+        if not is_magi_to_hstu_installed:
+            self.skipTest(_FA4_BLOCK_META_SKIP_NO_MAGI_TO_HSTU)
+
+        total_seqlen = 512
+        num_heads_q, num_heads_kv = 4, 4
+        head_dim = 64
+        dtype = torch.bfloat16
+        chunk_size = 256
+        q_ranges = AttnRanges.from_ranges([[0, total_seqlen]])
+        k_ranges = AttnRanges.from_ranges([[0, total_seqlen]])
+        pad_size = compute_pad_size(total_seqlen, self.world_size, chunk_size)
+        dist_attn_config = DistAttnConfig(
+            dispatch_config=DispatchConfig(alg=MinHeapDispatchAlg()),
+            overlap_config=OverlapConfig(
+                alg=UniformOverlapAlg(),
+                calc_cost_factor=get_calc_cost_factor(
+                    num_heads_q=num_heads_q,
+                    head_dim=head_dim,
+                    tflops=H100_TFLOPS_16,
+                    mfu=H100_MATMUL_MFU,
+                ),
+                comm_cost_factor=get_comm_cost_factor(
+                    num_heads_kv=num_heads_kv,
+                    head_dim=head_dim,
+                    bandwidth=H100_NVLINK_BANDWIDTH,
+                    bwu=H100_NVLINK_A2A_BWU,
+                    corr_factor=get_a2a_corr_factor(self.world_size),
+                ),
+            ),
+        )
+        key = magi_attn_flex_key(
+            q_ranges=q_ranges,
+            k_ranges=k_ranges,
+            attn_mask_type=[AttnMaskType.FULL],
+            total_seqlen_q=total_seqlen,
+            total_seqlen_k=total_seqlen,
+            num_heads_q=num_heads_q,
+            num_heads_kv=num_heads_kv,
+            head_dim=head_dim,
+            pad_size=pad_size,
+            chunk_size=chunk_size,
+            cp_group_or_mesh=self.device_mesh
+            if magi_attention.comm.is_hierarchical_comm_enable()
+            else self.nccl_group,
+            dist_attn_config=dist_attn_config,
+        )
+        mgr = dist_attn_runtime_dict_mgr[key]
+        if mgr.dist_attn_runtime.overlap_degree == 0:
+            self.skipTest("This config did not produce remote overlap stages")
+
+        x = torch.randn(total_seqlen, head_dim, device=self.device, dtype=dtype)
+        local_x = dispatch(x, key=key)
+        sq = local_x.shape[0]
+        local_q = torch.randn(sq, num_heads_q, head_dim, device=self.device, dtype=dtype)
+        local_k = torch.randn(sq, num_heads_kv, head_dim, device=self.device, dtype=dtype)
+        local_v = torch.randn(sq, num_heads_kv, head_dim, device=self.device, dtype=dtype)
+        with pytest.raises(NotImplementedError, match="overlap_degree"):
+            calc_attn(
+                local_q,
+                local_k,
+                local_v,
+                key,
+                custom_attribute=CalcAttnCustomAttribute(return_block_lse=True),
+            )
 
 
 class TestInterfaceWithWorldSize3(TestInterfaceBaseWithWorldSize1):

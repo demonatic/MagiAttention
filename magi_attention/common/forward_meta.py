@@ -18,6 +18,19 @@ import torch
 
 
 @dataclass
+class CalcAttnCustomAttribute:
+    """Optional flags for :func:`~magi_attention.api.calc_attn` (FA4 / SM100 path).
+
+    When ``return_block_max`` or ``return_block_lse`` is True, requires FA4 backend and
+    ``overlap_degree == 0``; see ``AttnForwardMeta.block_max`` / ``block_lse`` shapes.
+    """
+
+    return_block_max: bool = False
+    return_block_lse: bool = False
+    k_sparse_block_size: int = 128
+
+
+@dataclass
 class AttnForwardMeta:
     """Attention forward metadata.
 
@@ -28,7 +41,14 @@ class AttnForwardMeta:
         max_logits: Maximum logits per query head. In a distributed setting,
             this is a replicated tensor where each device holds the global maximum
             computed across the entire sequence, ensuring consistency across all devices.
+        block_max: Per-K-block max scores (FA4 ``max_score``), shape
+            ``(seqlen_q, num_heads_q, ceil(seqlen_k / k_sparse_block_size))``, float32;
+            ``None`` if not requested.
+        block_lse: Per-K-block scaled LSE (FA4 ``block_lse_out``), same shape as
+            ``block_max``; ``None`` if not requested.
     """
 
     lse: torch.Tensor | None
     max_logits: torch.Tensor | None
+    block_max: torch.Tensor | None = None
+    block_lse: torch.Tensor | None = None

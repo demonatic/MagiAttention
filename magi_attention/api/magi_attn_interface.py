@@ -20,7 +20,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from typing_extensions import deprecated
 
 import magi_attention
-from magi_attention.common import AttnForwardMeta, AttnRanges
+from magi_attention.common import AttnForwardMeta, AttnRanges, CalcAttnCustomAttribute
 from magi_attention.common.enum import AttnMaskType
 from magi_attention.config import DistAttnConfig
 from magi_attention.dist_attn_runtime_mgr import (
@@ -875,6 +875,7 @@ def calc_attn(
     softmax_scale: float | None = None,
     softcap: float = 0.0,
     return_max_logits: bool = False,
+    custom_attribute: CalcAttnCustomAttribute | None = None,
 ) -> tuple[torch.Tensor, AttnForwardMeta]:
     """
     Calculate distributed attention with local q, k, v tensors.
@@ -901,6 +902,10 @@ def calc_attn(
             introduced in Kimi K2: https://arxiv.org/pdf/2507.20534.pdf.
             Defaults to ``False``.
 
+        custom_attribute (CalcAttnCustomAttribute, optional): optional flags for FA4-only
+            outputs ``block_max`` / ``block_lse`` in ``AttnForwardMeta`` (requires FA4 backend
+            and ``overlap_degree == 0``). Defaults to ``None``.
+
     Returns:
         tuple[torch.Tensor, AttnForwardMeta]:
             - out (torch.Tensor): local output tensor.
@@ -908,6 +913,9 @@ def calc_attn(
                 for now, including local ``lse`` (torch.Tensor) with dtype=torch.float32,
                 and global ``max_logits`` (torch.Tensor) with dtype=torch.float32,
                 if ``return_max_logits`` is ``True``, otherwise ``None``.
+                When requested via ``custom_attribute``, ``block_max`` and ``block_lse`` are
+                float32 tensors of shape
+                ``[num_tokens_q_local, num_heads_q, ceil(num_tokens_kv_local / k_sparse_block_size)]``.
 
     Shapes:
         - q: [num_tokens_q_local, num_heads_q, head_dim]
@@ -934,6 +942,7 @@ def calc_attn(
         softmax_scale=softmax_scale,
         softcap=softcap,
         return_max_logits=return_max_logits,
+        custom_attribute=custom_attribute,
     )
 
 
