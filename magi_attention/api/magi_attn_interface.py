@@ -903,8 +903,9 @@ def calc_attn(
             Defaults to ``False``.
 
         custom_attribute (CalcAttnCustomAttribute, optional): optional flags for FA4-only
-            outputs ``block_max`` / ``block_lse`` in ``AttnForwardMeta`` (requires FA4 backend
-            and ``overlap_degree == 0``). Defaults to ``None``.
+            outputs ``block_max`` / ``block_lse`` in ``AttnForwardMeta`` (requires FA4 backend).
+            When ``overlap_degree > 0``, outputs are concatenated across all stages in global
+            KV order. Defaults to ``None``.
 
     Returns:
         tuple[torch.Tensor, AttnForwardMeta]:
@@ -915,7 +916,8 @@ def calc_attn(
                 if ``return_max_logits`` is ``True``, otherwise ``None``.
                 When requested via ``custom_attribute``, ``block_max`` and ``block_lse`` are
                 float32 tensors of shape
-                ``[num_tokens_q_local, num_heads_q, ceil(num_tokens_kv_local / k_sparse_block_size)]``.
+                ``[num_tokens_q_local, num_heads_q, ceil(num_tokens_kv_total / k_sparse_block_size)]``
+                where ``num_tokens_kv_total`` covers all stages when ``overlap_degree > 0``.
 
     Shapes:
         - q: [num_tokens_q_local, num_heads_q, head_dim]

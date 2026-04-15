@@ -55,7 +55,6 @@ from magi_attention.dist_attn_runtime_mgr import (
     DistAttnRuntimeMgr,
     init_dist_attn_runtime_mgr,
 )
-from magi_attention.meta.collection.calc_meta import is_magi_to_hstu_installed
 from magi_attention.testing import parameterize
 from magi_attention.testing.dist_common import (
     INTERFACE,
@@ -76,13 +75,6 @@ from magi_attention.utils import (
     get_calc_cost_factor,
     get_comm_cost_factor,
     is_list_value_all,
-)
-
-# FA4 ``calc_attn`` / block meta tests need ``magi_to_hstu_cuda`` (mask -> HSTU for FA4 kernels).
-# Build from flash-attention: ``cd csrc/utils/magi_to_hstu && pip install .`` (see that ``setup.py``).
-_FA4_BLOCK_META_SKIP_NO_MAGI_TO_HSTU = (
-    "magi_to_hstu_cuda is not installed (required for FA4AttnArg / FA4 calc_attn). "
-    "Install from flash-attention: cd <flash-attention>/csrc/utils/magi_to_hstu && pip install ."
 )
 
 
@@ -774,8 +766,6 @@ class TestInterfaceBaseWithWorldSize1(DistTestBase):
             self.skipTest("FA build lacks max_score_out")
         if not fa4_mod.flash_attn_fwd_supports_block_lse_out():
             self.skipTest("FA build lacks block_lse_out")
-        if not is_magi_to_hstu_installed:
-            self.skipTest(_FA4_BLOCK_META_SKIP_NO_MAGI_TO_HSTU)
 
         total_seqlen = 256
         num_heads_q, num_heads_kv = 4, 4
@@ -848,8 +838,6 @@ class TestInterfaceBaseWithWorldSize1(DistTestBase):
         assert meta.block_lse.shape == (sq, num_heads_q, n_chunks)
         assert meta.block_max.dtype == torch.float32
         assert meta.block_lse.dtype == torch.float32
-
-        print(f"block max: {meta.block_max} block lse: {meta.block_lse}")
 
     @skip_if_lt_x_gpu(1)
     @with_comms
@@ -927,23 +915,26 @@ class TestInterfaceWithWorldSize2(TestInterfaceBaseWithWorldSize1):
 
     @skip_if_lt_x_gpu(2)
     @with_comms
-    def test_calc_attn_custom_attribute_overlap_raises(self):
+    def test_calc_attn_custom_attribute_overlap_block_shapes(self):
+        """block_max / block_lse must be returned with correct shapes when
+        overlap_degree > 0 (the restriction was lifted)."""
         if not magi_attention.is_fa4_backend_enable():
             self.skipTest("FA4 backend not enabled")
         from magi_attention.functional import fa4 as fa4_mod
 
         if not fa4_mod.is_fa4_installed:
             self.skipTest("flash_attn not installed")
+        if not fa4_mod.flash_attn_fwd_supports_max_score_out():
+            self.skipTest("FA build lacks max_score_out")
         if not fa4_mod.flash_attn_fwd_supports_block_lse_out():
             self.skipTest("FA build lacks block_lse_out")
-        if not is_magi_to_hstu_installed:
-            self.skipTest(_FA4_BLOCK_META_SKIP_NO_MAGI_TO_HSTU)
 
         total_seqlen = 512
         num_heads_q, num_heads_kv = 4, 4
         head_dim = 64
         dtype = torch.bfloat16
         chunk_size = 256
+        k_sparse_block_size = 128
         q_ranges = AttnRanges.from_ranges([[0, total_seqlen]])
         k_ranges = AttnRanges.from_ranges([[0, total_seqlen]])
         pad_size = compute_pad_size(total_seqlen, self.world_size, chunk_size)
@@ -992,14 +983,178 @@ class TestInterfaceWithWorldSize2(TestInterfaceBaseWithWorldSize1):
         local_q = torch.randn(sq, num_heads_q, head_dim, device=self.device, dtype=dtype)
         local_k = torch.randn(sq, num_heads_kv, head_dim, device=self.device, dtype=dtype)
         local_v = torch.randn(sq, num_heads_kv, head_dim, device=self.device, dtype=dtype)
-        with pytest.raises(NotImplementedError, match="overlap_degree"):
-            calc_attn(
-                local_q,
-                local_k,
-                local_v,
-                key,
-                custom_attribute=CalcAttnCustomAttribute(return_block_lse=True),
-            )
+        custom = CalcAttnCustomAttribute(
+            return_block_max=True,
+            return_block_lse=True,
+            k_sparse_block_size=k_sparse_block_size,
+        )
+        _, meta = calc_attn(
+            local_q, local_k, local_v, key,
+            custom_attribute=custom,
+        )
+
+        # total n_chunks across all stages (host + remote)
+        calc_meta = mgr.dist_attn_runtime.calc_meta
+        total_sk = calc_meta.seqlen_k_local + sum(calc_meta.seqlen_k_per_remote_stage)
+        n_chunks = (total_sk + k_sparse_block_size - 1) // k_sparse_block_size
+
+        assert meta.block_max is not None, "block_max should not be None with overlap"
+        assert meta.block_lse is not None, "block_lse should not be None with overlap"
+        assert meta.block_max.shape == (sq, num_heads_q, n_chunks), (
+            f"block_max shape mismatch: {meta.block_max.shape} vs expected ({sq}, {num_heads_q}, {n_chunks})"
+        )
+        assert meta.block_lse.shape == (sq, num_heads_q, n_chunks), (
+            f"block_lse shape mismatch: {meta.block_lse.shape} vs expected ({sq}, {num_heads_q}, {n_chunks})"
+        )
+        assert meta.block_max.dtype == torch.float32
+        assert meta.block_lse.dtype == torch.float32
+        # at least some values should be finite (not all -inf)
+        assert (meta.block_max > float("-inf")).any(), "block_max is all -inf"
+        assert (meta.block_lse > float("-inf")).any(), "block_lse is all -inf"
+
+    @skip_if_lt_x_gpu(2)
+    @with_comms
+    def test_calc_attn_block_meta_overlap_consistency(self):
+        """block_max / block_lse from different overlap_degree values must be
+        consistent: splitting remote KV into more stages and concatenating must
+        produce the same per-K-block results."""
+        if not magi_attention.is_fa4_backend_enable():
+            self.skipTest("FA4 backend not enabled")
+        from magi_attention.functional import fa4 as fa4_mod
+
+        if not fa4_mod.is_fa4_installed:
+            self.skipTest("flash_attn not installed")
+        if not fa4_mod.flash_attn_fwd_supports_max_score_out():
+            self.skipTest("FA build lacks max_score_out")
+        if not fa4_mod.flash_attn_fwd_supports_block_lse_out():
+            self.skipTest("FA build lacks block_lse_out")
+
+        # Use seqlen divisible by both world_size and k_sparse_block_size
+        # so that chunk boundaries align with K-block boundaries.
+        total_seqlen = 1024
+        num_heads_q, num_heads_kv = 4, 4
+        head_dim = 64
+        dtype = torch.bfloat16
+        chunk_size = 512
+        k_sparse_block_size = 128
+        q_ranges = AttnRanges.from_ranges([[0, total_seqlen]])
+        k_ranges = AttnRanges.from_ranges([[0, total_seqlen]])
+        pad_size = compute_pad_size(total_seqlen, self.world_size, chunk_size)
+
+        cost_kwargs = dict(
+            calc_cost_factor=get_calc_cost_factor(
+                num_heads_q=num_heads_q,
+                head_dim=head_dim,
+                tflops=H100_TFLOPS_16,
+                mfu=H100_MATMUL_MFU,
+            ),
+            comm_cost_factor=get_comm_cost_factor(
+                num_heads_kv=num_heads_kv,
+                head_dim=head_dim,
+                bandwidth=H100_NVLINK_BANDWIDTH,
+                bwu=H100_NVLINK_A2A_BWU,
+                corr_factor=get_a2a_corr_factor(self.world_size),
+            ),
+        )
+
+        # Config A: minimal overlap (enable=False → degree=1)
+        config_a = DistAttnConfig(
+            dispatch_config=DispatchConfig(alg=MinHeapDispatchAlg()),
+            overlap_config=OverlapConfig(
+                enable=False,
+                alg=UniformOverlapAlg(),
+                **cost_kwargs,
+            ),
+        )
+        # Config B: more overlap stages (degree=4, min_chunk_size=128 for alignment)
+        config_b = DistAttnConfig(
+            dispatch_config=DispatchConfig(alg=MinHeapDispatchAlg()),
+            overlap_config=OverlapConfig(
+                enable=True,
+                mode=AttnOverlapMode.STATIC,
+                degree=4,
+                min_chunk_size=k_sparse_block_size,
+                max_num_chunks=64,
+                alg=UniformOverlapAlg(),
+                **cost_kwargs,
+            ),
+        )
+
+        cp_group_or_mesh = (
+            self.device_mesh
+            if magi_attention.comm.is_hierarchical_comm_enable()
+            else self.nccl_group
+        )
+        common_key_kwargs = dict(
+            q_ranges=q_ranges,
+            k_ranges=k_ranges,
+            attn_mask_type=[AttnMaskType.FULL],
+            total_seqlen_q=total_seqlen,
+            total_seqlen_k=total_seqlen,
+            num_heads_q=num_heads_q,
+            num_heads_kv=num_heads_kv,
+            head_dim=head_dim,
+            pad_size=pad_size,
+            chunk_size=chunk_size,
+            cp_group_or_mesh=cp_group_or_mesh,
+        )
+        key_a = magi_attn_flex_key(**common_key_kwargs, dist_attn_config=config_a)
+        key_b = magi_attn_flex_key(**common_key_kwargs, dist_attn_config=config_b)
+
+        mgr_a = dist_attn_runtime_dict_mgr[key_a]
+        mgr_b = dist_attn_runtime_dict_mgr[key_b]
+        if mgr_b.dist_attn_runtime.overlap_degree <= 1:
+            self.skipTest("Config B did not produce > 1 overlap stages")
+
+        # Dispatch dummy to get local sequence length then generate random QKV
+        x = torch.randn(total_seqlen, head_dim, device=self.device, dtype=dtype)
+        local_x_a = dispatch(x, key=key_a)
+        local_x_b = dispatch(x, key=key_b)
+        # Same dispatch → same local seqlen
+        assert local_x_a.shape[0] == local_x_b.shape[0], (
+            f"Dispatch mismatch: {local_x_a.shape[0]} vs {local_x_b.shape[0]}"
+        )
+        sq = local_x_a.shape[0]
+
+        torch.manual_seed(self.seed + dist.get_rank())
+        local_q = torch.randn(sq, num_heads_q, head_dim, device=self.device, dtype=dtype)
+        local_k = torch.randn(sq, num_heads_kv, head_dim, device=self.device, dtype=dtype)
+        local_v = torch.randn(sq, num_heads_kv, head_dim, device=self.device, dtype=dtype)
+
+        custom = CalcAttnCustomAttribute(
+            return_block_max=True,
+            return_block_lse=True,
+            k_sparse_block_size=k_sparse_block_size,
+        )
+
+        _, meta_a = calc_attn(local_q, local_k, local_v, key_a, custom_attribute=custom)
+        _, meta_b = calc_attn(local_q, local_k, local_v, key_b, custom_attribute=custom)
+
+        assert meta_a.block_max is not None and meta_b.block_max is not None
+        assert meta_a.block_lse is not None and meta_b.block_lse is not None
+        # Both configs cover the same total KV → same shape
+        assert meta_a.block_max.shape == meta_b.block_max.shape, (
+            f"Shape mismatch: {meta_a.block_max.shape} vs {meta_b.block_max.shape}"
+        )
+        assert meta_a.block_lse.shape == meta_b.block_lse.shape, (
+            f"Shape mismatch: {meta_a.block_lse.shape} vs {meta_b.block_lse.shape}"
+        )
+        # Same FA4 kernel on same data, just different staging.
+        # block_max is a pure max-reduce → bit-exact.
+        # block_lse involves log-sum-exp whose internal accumulation order may
+        # differ when the kernel sees a different total number of K-blocks,
+        # so we allow a tiny tolerance.
+        torch.testing.assert_close(
+            meta_a.block_max, meta_b.block_max,
+            atol=0, rtol=0,
+            msg="block_max values differ between overlap degree=1 and degree=4",
+        )
+        max_lse_diff = (meta_a.block_lse - meta_b.block_lse).abs().max().item()
+        torch.testing.assert_close(
+            meta_a.block_lse, meta_b.block_lse,
+            atol=1e-5, rtol=1e-5,
+            msg=f"block_lse values differ between overlap degree=1 and degree=4 (max_abs_diff={max_lse_diff})",
+        )
 
 
 class TestInterfaceWithWorldSize3(TestInterfaceBaseWithWorldSize1):

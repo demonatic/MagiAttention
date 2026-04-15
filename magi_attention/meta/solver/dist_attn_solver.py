@@ -1895,6 +1895,18 @@ class DistAttnSolver(BaseDistAttnSolver):
             )
             seqlen_k_per_remote_stage.append(num_remote_kv_tokens)
 
+        # ---   compute host_stage_insert_idx for block_max/block_lse ordering   --- #
+
+        host_stage_insert_idx = 0
+        if self.remote_rank_entry_per_stage_this_rank:
+            host_k_ranges = self.host_k_ranges_global
+            if not host_k_ranges.is_empty():
+                host_k_start = host_k_ranges.start
+                for remote_entry in self.remote_rank_entry_per_stage_this_rank:
+                    rk = remote_entry.remote_k_ranges_global
+                    if not rk.is_empty() and rk.start < host_k_start:
+                        host_stage_insert_idx += 1
+
         # ---   build attn calc meta   --- #
 
         calc_meta = CalcMeta(
@@ -1903,6 +1915,7 @@ class DistAttnSolver(BaseDistAttnSolver):
             seqlen_q_shard=self.shard_seqlen_q,
             seqlen_k_local=self.total_seqlen_k - sum(seqlen_k_per_remote_stage),
             seqlen_k_per_remote_stage=seqlen_k_per_remote_stage,
+            host_stage_insert_idx=host_stage_insert_idx,
         )
 
         return calc_meta

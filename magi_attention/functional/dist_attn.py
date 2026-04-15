@@ -65,11 +65,6 @@ def _validate_calc_attn_custom_attribute(
             "return_block_max / return_block_lse require FA4 backend "
             "(dist_attn_runtime.use_fa4_backend)."
         )
-    if dist_attn_runtime.overlap_degree != 0:
-        raise NotImplementedError(
-            "return_block_max / return_block_lse are only supported when "
-            f"overlap_degree == 0 (got {dist_attn_runtime.overlap_degree=})."
-        )
 
 
 is_magi_attn_ext_installed = False
@@ -3033,6 +3028,16 @@ class DistAttnFunc(torch.autograd.Function):
         local_block_max = partial_local_meta.block_max
         local_block_lse = partial_local_meta.block_lse
 
+        # whether we need to collect block_max/block_lse from remote stages
+        want_blocks = (
+            custom_attribute is not None
+            and (custom_attribute.return_block_max or custom_attribute.return_block_lse)
+            and dist_attn_runtime.overlap_degree > 0
+        )
+        if want_blocks:
+            remote_block_maxes: list[torch.Tensor | None] = []
+            remote_block_lses: list[torch.Tensor | None] = []
+
         # loop into remote stages
         for ith_overlap_stage in range(dist_attn_runtime.overlap_degree):
             if logger.isEnabledFor(logging.DEBUG):
@@ -3093,6 +3098,15 @@ class DistAttnFunc(torch.autograd.Function):
             if return_max_logits and partial_remote_meta is not None:
                 partial_local_max_logits = partial_remote_meta.max_logits
 
+            # collect block_max/block_lse from remote stages
+            if want_blocks:
+                if partial_remote_meta is not None:
+                    remote_block_maxes.append(partial_remote_meta.block_max)
+                    remote_block_lses.append(partial_remote_meta.block_lse)
+                else:
+                    remote_block_maxes.append(None)
+                    remote_block_lses.append(None)
+
             # reset kernel barrier for next stage
             kernel_barrier_reduce.reset()
 
@@ -3122,6 +3136,54 @@ class DistAttnFunc(torch.autograd.Function):
             )
         else:
             local_max_logits = None
+
+        # concatenate block_max/block_lse from all stages in global KV order
+        if want_blocks:
+            calc_meta = dist_attn_runtime.calc_meta
+            k_blk = custom_attribute.k_sparse_block_size
+            sq, nh = local_q.shape[0], local_q.shape[1]
+            dev = local_q.device
+            insert_idx = calc_meta.host_stage_insert_idx
+
+            # build ordered lists: insert host among remote stages
+            ordered_blocks = list(remote_block_maxes)
+            ordered_blocks.insert(insert_idx, local_block_max)
+            ordered_lses = list(remote_block_lses)
+            ordered_lses.insert(insert_idx, local_block_lse)
+            ordered_sk = list(calc_meta.seqlen_k_per_remote_stage)
+            ordered_sk.insert(insert_idx, calc_meta.seqlen_k_local)
+
+            def _fill_and_cat(
+                items: list[torch.Tensor | None],
+                seqlen_ks: list[int],
+                want: bool,
+            ) -> torch.Tensor | None:
+                if not want:
+                    return None
+                parts: list[torch.Tensor] = []
+                for blk, sk in zip(items, seqlen_ks):
+                    nc = (sk + k_blk - 1) // k_blk
+                    if nc == 0:
+                        continue  # idle stage with no KV
+                    if blk is not None:
+                        parts.append(blk)
+                    else:
+                        parts.append(
+                            torch.full(
+                                (sq, nh, nc),
+                                float("-inf"),
+                                dtype=torch.float32,
+                                device=dev,
+                            )
+                        )
+                return torch.cat(parts, dim=2) if parts else None
+
+            local_block_max = _fill_and_cat(
+                ordered_blocks, ordered_sk, custom_attribute.return_block_max
+            )
+            local_block_lse = _fill_and_cat(
+                ordered_lses, ordered_sk, custom_attribute.return_block_lse
+            )
 
         if dist_attn_runtime.save_tail_stage:
             last_stage_q, last_stage_kv = curr_remote_q, curr_remote_kv
@@ -3335,7 +3397,7 @@ def dist_attn_func(
             (per head, shape [num_heads_q], all-reduced MAX across all ranks).
             Defaults to ``False``.
         custom_attribute (CalcAttnCustomAttribute, optional): optional FA4-only flags such as
-            ``return_block_max`` / ``return_block_lse`` (requires ``overlap_degree == 0``).
+            ``return_block_max`` / ``return_block_lse``.
 
     Returns:
         out (torch.Tensor): local out tensor

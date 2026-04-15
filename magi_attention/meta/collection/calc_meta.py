@@ -644,6 +644,11 @@ class CalcMeta:
         default_factory=list
     )  # for remote_attn_args_list
 
+    # Position at which to insert host-stage block_max/block_lse among remote
+    # stages so that the concatenated result follows global KV order.
+    # Only meaningful when overlap_degree > 0.
+    host_stage_insert_idx: int = 0
+
     @property
     def overlap_degree(self) -> int:
         return len(self.remote_attn_args_list)
