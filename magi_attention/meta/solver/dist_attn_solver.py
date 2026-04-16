@@ -1897,15 +1897,11 @@ class DistAttnSolver(BaseDistAttnSolver):
 
         # ---   compute host_stage_insert_idx for block_max/block_lse ordering   --- #
 
-        host_stage_insert_idx = 0
-        if self.remote_rank_entry_per_stage_this_rank:
-            host_k_ranges = self.host_k_ranges_global
-            if not host_k_ranges.is_empty():
-                host_k_start = host_k_ranges.start
-                for remote_entry in self.remote_rank_entry_per_stage_this_rank:
-                    rk = remote_entry.remote_k_ranges_global
-                    if not rk.is_empty() and rk.start < host_k_start:
-                        host_stage_insert_idx += 1
+        host_k_start = self.host_k_ranges_global.start if not self.host_k_ranges_global.is_empty() else 0
+        host_stage_insert_idx = sum(
+            1 for e in self.remote_rank_entry_per_stage_this_rank
+            if not e.remote_k_ranges_global.is_empty() and e.remote_k_ranges_global.start < host_k_start
+        )
 
         # ---   build attn calc meta   --- #
 
