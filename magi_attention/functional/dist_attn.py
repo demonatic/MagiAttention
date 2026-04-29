@@ -1247,6 +1247,11 @@ class DistAttnRuntime:
                     if custom_attribute is not None
                     else 128
                 )
+                max_per_doc = (
+                    custom_attribute.max_per_doc_seqlen_k
+                    if custom_attribute is not None
+                    else None
+                )
                 want_bm = custom_attribute is not None and custom_attribute.return_block_max
                 want_bl = custom_attribute is not None and custom_attribute.return_block_lse
                 partial_out, partial_lse, max_sc, blk_lse = fa4_fwd(
@@ -1263,6 +1268,7 @@ class DistAttnRuntime:
                     return_max_score=want_bm,
                     return_block_lse=want_bl,
                     k_sparse_block_size=k_blk,
+                    max_seqlen_k=max_per_doc,
                 )
                 meta = AttnForwardMeta(
                     lse=partial_lse,

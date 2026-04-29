@@ -53,11 +53,17 @@ def fa4_max_score_shape(
     k: torch.Tensor,
     *,
     k_sparse_block_size: int = 128,
+    max_seqlen_k: int | None = None,
 ) -> tuple[int, int, int, int]:
-    """Shape for ``max_score_out`` as passed to FA4 (with batch dim): ``(1, num_head, seqlen_q, n_k_chunks)``."""
+    """Shape for ``max_score_out`` as passed to FA4 (with batch dim): ``(1, num_head, seqlen_q, n_k_chunks)``.
+
+    When ``max_seqlen_k`` is provided (per-doc mode), the K-block dimension
+    is ``ceil(max_seqlen_k / k_sparse_block_size)`` instead of using the full
+    ``k.shape[0]``.
+    """
     seqlen_q, num_head = q.shape[0], q.shape[1]
-    seqlen_k = k.shape[0]
-    n_chunks = (seqlen_k + k_sparse_block_size - 1) // k_sparse_block_size
+    eff_k = max_seqlen_k if max_seqlen_k is not None else k.shape[0]
+    n_chunks = (eff_k + k_sparse_block_size - 1) // k_sparse_block_size
     return (1, num_head, seqlen_q, n_chunks)
 
 
@@ -76,6 +82,7 @@ def fa4_fwd(
     block_lse_out: Optional[torch.Tensor] = None,
     return_block_lse: bool = False,
     k_sparse_block_size: int = 128,
+    max_seqlen_k: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     assert is_fa4_installed, "FlashAttn4 is not installed"
     assert isinstance(attn_arg, FA4AttnArg), "FA4 is only supported for FA4AttnArg"
@@ -101,7 +108,7 @@ def fa4_fwd(
     if return_max_score:
         if max_score_out is not None:
             raise ValueError("Pass only one of return_max_score and max_score_out")
-        shape_ms = fa4_max_score_shape(q, k, k_sparse_block_size=k_sparse_block_size)
+        shape_ms = fa4_max_score_shape(q, k, k_sparse_block_size=k_sparse_block_size, max_seqlen_k=max_seqlen_k)
         max_score_out = torch.full(
             shape_ms,
             float("-inf"),
@@ -112,7 +119,7 @@ def fa4_fwd(
     if return_block_lse:
         if block_lse_out is not None:
             raise ValueError("Pass only one of return_block_lse and block_lse_out")
-        shape_bl = fa4_max_score_shape(q, k, k_sparse_block_size=k_sparse_block_size)
+        shape_bl = fa4_max_score_shape(q, k, k_sparse_block_size=k_sparse_block_size, max_seqlen_k=max_seqlen_k)
         block_lse_out = torch.full(
             shape_bl,
             float("-inf"),
@@ -153,7 +160,7 @@ def fa4_fwd(
 
     max_score_sqh: Optional[torch.Tensor] = None
     if max_score_out is not None:
-        # FA layout (B, H, S, C) with B=1 -> (S, H, C). Kernel does not write this buffer (smem-only).
+        # FA layout (B, H, S, C) with B=1 -> (S, H, C).
         max_score_sqh = max_score_out.squeeze(0).permute(1, 0, 2).contiguous()
 
     block_lse_sqh: Optional[torch.Tensor] = None
@@ -347,9 +354,8 @@ def ffa_fa4_func(
         reuse_attn_arg (bool): If True, reuse the cached FA4AttnArg from previous call.
             Set to False for warmup/first call, then True for subsequent calls
             to measure only kernel time without FA4AttnArg creation overhead.
-        return_max_score (bool): If True, enables the extra per-K-block max reduction in the FA4 kernel
-            (SM100); maxima live in shared memory only—the returned ``max_score`` tensor is **not**
-            filled and keeps its ``-inf`` initialization.
+        return_max_score (bool): If True, returns per-K-block max scores from the FA4
+            kernel (SM100).  Values are raw ``max(QK)`` without ``sm_scale``.
 
     Returns:
         (out, lse) or (out, lse, max_score) with ``max_score`` shape

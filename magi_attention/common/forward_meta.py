@@ -28,6 +28,7 @@ class CalcAttnCustomAttribute:
     return_block_max: bool = False
     return_block_lse: bool = False
     k_sparse_block_size: int = 128
+    max_per_doc_seqlen_k: int | None = None
 
 
 @dataclass
