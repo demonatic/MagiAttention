@@ -753,53 +753,33 @@ class TestInterfaceBaseWithWorldSize1(DistTestBase):
                 new_mgr == ref_new_mgr
             ), f"For {test_case=}, the {new_mgr=} is not equal to the {ref_new_mgr=}."
 
-    @skip_if_lt_x_gpu(1)
-    @with_comms
-    def test_calc_attn_custom_attribute_fa4_block_shapes(self):
-        if not magi_attention.is_fa4_backend_enable():
-            self.skipTest("FA4 backend not enabled")
-        from magi_attention.functional import fa4 as fa4_mod
+    def _check_block_score(
+        self, total_seqlen, num_docs, num_heads_q, num_heads_kv,
+        head_dim=128, block_size_k=128, chunk_size=256, seed=42,
+    ):
+        """Run one block_max / block_lse correctness check against PyTorch ref."""
+        import math
 
-        if not fa4_mod.is_fa4_installed:
-            self.skipTest("flash_attn not installed")
-        if not fa4_mod.flash_attn_fwd_supports_max_score_out():
-            self.skipTest("FA build lacks max_score_out")
-        if not fa4_mod.flash_attn_fwd_supports_block_lse_out():
-            self.skipTest("FA build lacks block_lse_out")
-
-        total_seqlen = 256
-        num_heads_q, num_heads_kv = 4, 4
-        head_dim = 64
         dtype = torch.bfloat16
-        chunk_size = 256
-        q_ranges = AttnRanges.from_ranges([[0, total_seqlen]])
-        k_ranges = AttnRanges.from_ranges([[0, total_seqlen]])
-        pad_size = compute_pad_size(total_seqlen, self.world_size, chunk_size)
-        dist_attn_config = DistAttnConfig(
-            dispatch_config=DispatchConfig(alg=MinHeapDispatchAlg()),
-            overlap_config=OverlapConfig(
-                alg=UniformOverlapAlg(),
-                calc_cost_factor=get_calc_cost_factor(
-                    num_heads_q=num_heads_q,
-                    head_dim=head_dim,
-                    tflops=H100_TFLOPS_16,
-                    mfu=H100_MATMUL_MFU,
-                ),
-                comm_cost_factor=get_comm_cost_factor(
-                    num_heads_kv=num_heads_kv,
-                    head_dim=head_dim,
-                    bandwidth=H100_NVLINK_BANDWIDTH,
-                    bwu=H100_NVLINK_A2A_BWU,
-                    corr_factor=get_a2a_corr_factor(self.world_size),
-                ),
-            ),
+        sm_scale = head_dim ** -0.5
+        sm_scale_log2e = sm_scale * math.log2(math.e)
+
+        torch.manual_seed(seed)
+        raw = torch.randint(
+            max(1, total_seqlen // (num_docs * 2)),
+            total_seqlen // num_docs + 1,
+            (num_docs,),
         )
-        key = magi_attn_flex_key(
-            q_ranges=q_ranges,
-            k_ranges=k_ranges,
-            attn_mask_type=[AttnMaskType.FULL],
-            total_seqlen_q=total_seqlen,
-            total_seqlen_k=total_seqlen,
+        doc_lens = (raw.float() / raw.sum() * total_seqlen).int()
+        doc_lens[-1] = total_seqlen - doc_lens[:-1].sum()
+        cu_seqlens = torch.zeros(num_docs + 1, dtype=torch.int32, device=self.device)
+        cu_seqlens[1:] = torch.cumsum(doc_lens.to(self.device), dim=0)
+        max_seqlen = int(doc_lens.max().item())
+
+        pad_size = compute_pad_size(total_seqlen, self.world_size, chunk_size)
+        key = magi_attn_varlen_key(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
             num_heads_q=num_heads_q,
             num_heads_kv=num_heads_kv,
             head_dim=head_dim,
@@ -808,36 +788,127 @@ class TestInterfaceBaseWithWorldSize1(DistTestBase):
             cp_group_or_mesh=self.device_mesh
             if magi_attention.comm.is_hierarchical_comm_enable()
             else self.nccl_group,
-            dist_attn_config=dist_attn_config,
+            causal=True,
         )
-        mgr = dist_attn_runtime_dict_mgr[key]
-        assert mgr.dist_attn_runtime.overlap_degree == 0
 
         x = torch.randn(total_seqlen, head_dim, device=self.device, dtype=dtype)
         local_x = dispatch(x, key=key)
         sq = local_x.shape[0]
-        local_q = torch.randn(sq, num_heads_q, head_dim, device=self.device, dtype=dtype)
-        local_k = torch.randn(sq, num_heads_kv, head_dim, device=self.device, dtype=dtype)
-        local_v = torch.randn(sq, num_heads_kv, head_dim, device=self.device, dtype=dtype)
+
+        torch.manual_seed(seed + 1)
+        q = torch.randn(sq, num_heads_q, head_dim, device=self.device, dtype=dtype)
+        k = torch.randn(sq, num_heads_kv, head_dim, device=self.device, dtype=dtype)
+        v = torch.randn(sq, num_heads_kv, head_dim, device=self.device, dtype=dtype)
+
         custom = CalcAttnCustomAttribute(
             return_block_max=True,
             return_block_lse=True,
-            k_sparse_block_size=128,
+            k_sparse_block_size=block_size_k,
         )
-        _, meta = calc_attn(
-            local_q,
-            local_k,
-            local_v,
-            key,
-            custom_attribute=custom,
-        )
-        n_chunks = (sq + 127) // 128
+        _, meta = calc_attn(q, k, v, key, custom_attribute=custom)
         assert meta.block_max is not None
         assert meta.block_lse is not None
-        assert meta.block_max.shape == (sq, num_heads_q, n_chunks)
-        assert meta.block_lse.shape == (sq, num_heads_q, n_chunks)
-        assert meta.block_max.dtype == torch.float32
-        assert meta.block_lse.dtype == torch.float32
+
+        # --- PyTorch reference (memory-efficient: block-by-block) ---
+        n_kblocks = math.ceil(max_seqlen / block_size_k)
+        ref_block_max = torch.full(
+            (total_seqlen, num_heads_q, n_kblocks),
+            float("-inf"), dtype=torch.float32, device=self.device,
+        )
+        ref_block_lse = torch.full(
+            (total_seqlen, num_heads_q, n_kblocks),
+            float("-inf"), dtype=torch.float32, device=self.device,
+        )
+
+        gqa_ratio = num_heads_q // num_heads_kv
+        for d in range(num_docs):
+            qs = cu_seqlens[d].item()
+            qe = cu_seqlens[d + 1].item()
+            doc_len = qe - qs
+            q_doc = q[qs:qe].float()
+            k_doc = k[qs:qe].float()
+            if gqa_ratio > 1:
+                k_doc = k_doc.repeat_interleave(gqa_ratio, dim=1)
+            q_idx = torch.arange(doc_len, device=self.device)
+
+            n_doc_blocks = math.ceil(doc_len / block_size_k)
+            for b in range(n_doc_blocks):
+                k_s = b * block_size_k
+                k_e = min((b + 1) * block_size_k, doc_len)
+                qk_block = torch.einsum(
+                    'qhd,khd->hqk', q_doc, k_doc[k_s:k_e]
+                )
+                causal_mask = q_idx[:, None] < torch.arange(
+                    k_s, k_e, device=self.device
+                )[None, :]
+                qk_block[:, causal_mask] = float("-inf")
+
+                ref_block_max[qs:qe, :, b] = (
+                    qk_block.max(dim=2).values.T * sm_scale_log2e
+                )
+                ref_block_lse[qs:qe, :, b] = torch.logsumexp(
+                    qk_block * sm_scale, dim=2
+                ).T
+
+        # --- Compare ---
+        n = min(n_kblocks, meta.block_max.shape[2])
+        label = f"{total_seqlen // 1024}K-{num_docs}doc-{num_heads_q}h"
+
+        for name, magi_out, ref_out in [
+            ("block_max", meta.block_max, ref_block_max),
+            ("block_lse", meta.block_lse, ref_block_lse),
+        ]:
+            magi_t = magi_out[:total_seqlen, :, :n]
+            ref_t = ref_out[:, :, :n]
+
+            ref_inf = ref_t == float("-inf")
+            magi_inf = magi_t == float("-inf")
+            disagree = (ref_inf != magi_inf).sum().item()
+            assert disagree == 0, (
+                f"[{label}] {name}: {disagree} -inf positions disagree"
+            )
+
+            valid = torch.isfinite(ref_t) & torch.isfinite(magi_t)
+            assert valid.any(), f"[{label}] {name}: no valid entries"
+            ref_v = ref_t[valid].double()
+            magi_v = magi_t[valid].double()
+
+            cos_sim = torch.nn.functional.cosine_similarity(
+                ref_v.unsqueeze(0), magi_v.unsqueeze(0)
+            ).item()
+            assert cos_sim > 0.99999, (
+                f"[{label}] {name} cosine similarity {cos_sim:.7f} < 0.99999"
+            )
+            torch.testing.assert_close(magi_v, ref_v, atol=1e-4, rtol=1e-4)
+
+        import gc
+        del meta, ref_block_max, ref_block_lse
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @skip_if_lt_x_gpu(1)
+    @with_comms
+    def test_calc_attn_block_score_correctness(self):
+        """Verify block_max and block_lse against PyTorch reference (multi-doc varlen causal)."""
+        if not magi_attention.is_fa4_backend_enable():
+            self.skipTest("FA4 backend not enabled")
+        from magi_attention.functional import fa4 as fa4_mod
+
+        if not fa4_mod.is_fa4_installed:
+            self.skipTest("flash_attn not installed")
+
+        configs = [
+            # (total_seqlen, num_docs, num_heads_q, num_heads_kv)
+            (8192,    4,  4, 4),
+            (32768,   8,  4, 4),
+            (192000,  8,  4, 4),
+            (192000, 16,  1, 1),
+        ]
+        for i, (seqlen, ndocs, nhq, nhkv) in enumerate(configs):
+            self._check_block_score(
+                total_seqlen=seqlen, num_docs=ndocs,
+                num_heads_q=nhq, num_heads_kv=nhkv, seed=42 + i,
+            )
 
     @skip_if_lt_x_gpu(1)
     @with_comms
