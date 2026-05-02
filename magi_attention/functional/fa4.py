@@ -56,10 +56,12 @@ if is_fa4_installed:
         triton.Config({"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=4),
         triton.Config({"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2),
         triton.Config({"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 256}, num_warps=8, num_stages=2),
         triton.Config({"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 64}, num_warps=8, num_stages=2),
         triton.Config({"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 64}, num_warps=8, num_stages=3),
         triton.Config({"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2),
         triton.Config({"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 256}, num_warps=8, num_stages=2),
     ],
     key=["qk_head_dim", "block_size", "HAS_BLOCK_LSE"],
 )
@@ -161,22 +163,22 @@ def _flash_block_score_kernel(
     diag_start = pid_q * BLOCK_SIZE_Q // BLOCK_SIZE_K * BLOCK_SIZE_K
     hi = min(seq_len, (pid_q + 1) * BLOCK_SIZE_Q)
 
-    for i in tl.range(0, hi, BLOCK_SIZE_K):
+    for i in tl.range(0, hi, BLOCK_SIZE_K, num_stages=3):
         k = tl.load(k_ptrs, boundary_check=(1, 0), padding_option="zero")
         qk = tl.dot(q, k) * sm_scale_log2e
         if i >= diag_start:
             qk = tl.where(off_q[:, None] >= (i + off_k)[None, :], qk, float("-inf"))
 
-        score = tl.reshape(qk, (BLOCK_SIZE_Q, BLOCKS_PER_K_BLOCK, block_size), can_reorder=False)
-        score = tl.max(score, axis=2)
+        qk_3d = tl.reshape(qk, (BLOCK_SIZE_Q, BLOCKS_PER_K_BLOCK, block_size), can_reorder=False)
+        score = tl.max(qk_3d, axis=2)
         tl.store(s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1))
 
         if HAS_BLOCK_LSE:
-            qk_r = tl.reshape(qk, (BLOCK_SIZE_Q, BLOCKS_PER_K_BLOCK, block_size), can_reorder=False)
-            p = tl.exp2(qk_r - score[:, :, None])
-            off_k_r = tl.reshape(off_k, (BLOCKS_PER_K_BLOCK, block_size))
-            k_valid = (i + off_k_r)[None, :, :] < seq_len
-            p = tl.where(k_valid, p, 0.0)
+            p = tl.exp2(qk_3d - score[:, :, None])
+            if i + BLOCK_SIZE_K > seq_len:
+                off_k_r = tl.reshape(off_k, (BLOCKS_PER_K_BLOCK, block_size))
+                k_valid = (i + off_k_r)[None, :, :] < seq_len
+                p = tl.where(k_valid, p, 0.0)
             s = tl.sum(p, axis=2)
             safe_m = tl.where(score > float("-inf"), score, 0.0)
             blse = safe_m * 0.6931471806 + tl.log(tl.where(s > 0.0, s, 1e-20))
