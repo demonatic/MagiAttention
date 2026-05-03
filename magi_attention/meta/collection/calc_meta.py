@@ -649,6 +649,16 @@ class CalcMeta:
     # Only meaningful when overlap_degree > 0.
     host_stage_insert_idx: int = 0
 
+    # Global K document boundaries (cu_seqlens) for block scoring with CP>1.
+    # Empty when not using FA4 backend or CP=1.
+    global_cu_seqlens_k: list[int] = field(default_factory=list)
+
+    # Global start position of this rank's Q shard in the packed sequence.
+    host_q_start_global: int = 0
+
+    # Global start position of the reassembled full K for block scoring.
+    full_k_start_global: int = 0
+
     @property
     def overlap_degree(self) -> int:
         return len(self.remote_attn_args_list)

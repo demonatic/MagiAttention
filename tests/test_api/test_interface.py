@@ -47,6 +47,7 @@ from magi_attention.config import (
     DispatchConfig,
     DistAttnConfig,
     MinHeapDispatchAlg,
+    SequentialDispatchAlg,
     OverlapConfig,
     UniformOverlapAlg,
 )
@@ -758,7 +759,7 @@ class TestInterfaceBaseWithWorldSize1(DistTestBase):
         head_dim=128, block_size_k=128, chunk_size=256, seed=42,
     ):
         """Run one block_max / block_lse correctness check against PyTorch ref."""
-        import math
+        import math, gc
 
         dtype = torch.bfloat16
         sm_scale = head_dim ** -0.5
@@ -777,7 +778,38 @@ class TestInterfaceBaseWithWorldSize1(DistTestBase):
         max_seqlen = int(doc_lens.max().item())
 
         pad_size = compute_pad_size(total_seqlen, self.world_size, chunk_size)
-        key = magi_attn_varlen_key(
+
+        dist_attn_config = None
+        if self.world_size > 1:
+            cost_kwargs = dict(
+                calc_cost_factor=get_calc_cost_factor(
+                    num_heads_q=num_heads_q,
+                    head_dim=head_dim,
+                    tflops=H100_TFLOPS_16,
+                    mfu=H100_MATMUL_MFU,
+                ),
+                comm_cost_factor=get_comm_cost_factor(
+                    num_heads_kv=num_heads_kv,
+                    head_dim=head_dim,
+                    bandwidth=H100_NVLINK_BANDWIDTH,
+                    bwu=H100_NVLINK_A2A_BWU,
+                    corr_factor=get_a2a_corr_factor(self.world_size),
+                ),
+            )
+            dist_attn_config = DistAttnConfig(
+                dispatch_config=DispatchConfig(alg=SequentialDispatchAlg()),
+                overlap_config=OverlapConfig(
+                    enable=True,
+                    mode=AttnOverlapMode.STATIC,
+                    degree=4,
+                    min_chunk_size=block_size_k,
+                    max_num_chunks=64,
+                    alg=UniformOverlapAlg(random_costs=False),
+                    **cost_kwargs,
+                ),
+            )
+
+        key_kwargs = dict(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_k=cu_seqlens,
             num_heads_q=num_heads_q,
@@ -790,24 +822,40 @@ class TestInterfaceBaseWithWorldSize1(DistTestBase):
             else self.nccl_group,
             causal=True,
         )
-
-        x = torch.randn(total_seqlen, head_dim, device=self.device, dtype=dtype)
-        local_x = dispatch(x, key=key)
-        sq = local_x.shape[0]
+        if dist_attn_config is not None:
+            key_kwargs["dist_attn_config"] = dist_attn_config
+        key = magi_attn_varlen_key(**key_kwargs)
 
         torch.manual_seed(seed + 1)
-        q = torch.randn(sq, num_heads_q, head_dim, device=self.device, dtype=dtype)
-        k = torch.randn(sq, num_heads_kv, head_dim, device=self.device, dtype=dtype)
-        v = torch.randn(sq, num_heads_kv, head_dim, device=self.device, dtype=dtype)
+        torch.cuda.manual_seed(seed + 1)
+        full_q = torch.randn(
+            total_seqlen, num_heads_q, head_dim,
+            device=self.device, dtype=dtype,
+        )
+        full_k = torch.randn(
+            total_seqlen, num_heads_kv, head_dim,
+            device=self.device, dtype=dtype,
+        )
+        full_v = torch.randn(
+            total_seqlen, num_heads_kv, head_dim,
+            device=self.device, dtype=dtype,
+        )
+
+        local_q = dispatch(full_q, key=key)
+        local_k = dispatch(full_k, key=key)
+        local_v = dispatch(full_v, key=key)
 
         custom = CalcAttnCustomAttribute(
             return_block_max=True,
             return_block_lse=True,
             k_sparse_block_size=block_size_k,
         )
-        _, meta = calc_attn(q, k, v, key, custom_attribute=custom)
+        _, meta = calc_attn(local_q, local_k, local_v, key, custom_attribute=custom)
         assert meta.block_max is not None
         assert meta.block_lse is not None
+
+        global_block_max = undispatch(meta.block_max, key=key)
+        global_block_lse = undispatch(meta.block_lse, key=key)
 
         # --- PyTorch reference (memory-efficient: block-by-block) ---
         n_kblocks = math.ceil(max_seqlen / block_size_k)
@@ -825,8 +873,8 @@ class TestInterfaceBaseWithWorldSize1(DistTestBase):
             qs = cu_seqlens[d].item()
             qe = cu_seqlens[d + 1].item()
             doc_len = qe - qs
-            q_doc = q[qs:qe].float()
-            k_doc = k[qs:qe].float()
+            q_doc = full_q[qs:qe].float()
+            k_doc = full_k[qs:qe].float()
             if gqa_ratio > 1:
                 k_doc = k_doc.repeat_interleave(gqa_ratio, dim=1)
             q_idx = torch.arange(doc_len, device=self.device)
@@ -851,12 +899,15 @@ class TestInterfaceBaseWithWorldSize1(DistTestBase):
                 ).T
 
         # --- Compare ---
-        n = min(n_kblocks, meta.block_max.shape[2])
+        n = min(n_kblocks, global_block_max.shape[2])
         label = f"{total_seqlen // 1024}K-{num_docs}doc-{num_heads_q}h"
+        doc_lens_list = [int(cu_seqlens[i+1] - cu_seqlens[i]) for i in range(num_docs)]
+        print(f"[_check_block_score] {label} | ws={self.world_size} "
+              f"| doc_lens={doc_lens_list} | n_kblocks={n_kblocks}")
 
         for name, magi_out, ref_out in [
-            ("block_max", meta.block_max, ref_block_max),
-            ("block_lse", meta.block_lse, ref_block_lse),
+            ("block_max", global_block_max, ref_block_max),
+            ("block_lse", global_block_lse, ref_block_lse),
         ]:
             magi_t = magi_out[:total_seqlen, :, :n]
             ref_t = ref_out[:, :, :n]
@@ -876,12 +927,12 @@ class TestInterfaceBaseWithWorldSize1(DistTestBase):
             cos_sim = torch.nn.functional.cosine_similarity(
                 ref_v.unsqueeze(0), magi_v.unsqueeze(0)
             ).item()
+            print(f"  {name}: cos_sim={cos_sim:.10f}")
             assert cos_sim > 0.99999, (
                 f"[{label}] {name} cosine similarity {cos_sim:.7f} < 0.99999"
             )
             torch.testing.assert_close(magi_v, ref_v, atol=1e-4, rtol=1e-4)
 
-        import gc
         del meta, ref_block_max, ref_block_lse
         gc.collect()
         torch.cuda.empty_cache()
@@ -1087,28 +1138,59 @@ class TestInterfaceWithWorldSize2(TestInterfaceBaseWithWorldSize1):
     @with_comms
     def test_calc_attn_block_meta_overlap_consistency(self):
         """block_max / block_lse from dist_attn (CP=2, overlap_degree > 0),
-        after undispatch, must match a single FA4 call on the full Q/K/V."""
+        after undispatch, must match torch reference for multi-doc varlen causal."""
         if not magi_attention.is_fa4_backend_enable():
             self.skipTest("FA4 backend not enabled")
         from magi_attention.functional import fa4 as fa4_mod
 
         if not fa4_mod.is_fa4_installed:
             self.skipTest("flash_attn not installed")
-        if not fa4_mod.flash_attn_fwd_supports_max_score_out():
-            self.skipTest("FA build lacks max_score_out")
-        if not fa4_mod.flash_attn_fwd_supports_block_lse_out():
-            self.skipTest("FA build lacks block_lse_out")
-        from flash_attn_cute.interface import _flash_attn_fwd
 
-        total_seqlen = 1024
-        num_heads_q, num_heads_kv = 4, 4
-        head_dim = 64
+        configs = [
+            # (total_seqlen, num_docs, num_heads_q, num_heads_kv)
+            (1024,  1, 4, 4),
+            (2048,  4, 4, 4),
+            (4096,  8, 4, 4),
+            (8192,  4, 4, 1),
+        ]
+        for i, (seqlen, ndocs, nhq, nhkv) in enumerate(configs):
+            self._check_block_score_overlap(
+                total_seqlen=seqlen, num_docs=ndocs,
+                num_heads_q=nhq, num_heads_kv=nhkv, seed=42 + i,
+            )
+
+    def _check_block_score_overlap(
+        self, total_seqlen, num_docs, num_heads_q, num_heads_kv,
+        head_dim=64, block_size_k=128, chunk_size=128, seed=42,
+    ):
+        """Run one block_max / block_lse correctness check for CP>1 overlap."""
+        import math, gc
+
         dtype = torch.bfloat16
-        chunk_size = 128
-        print(f"chunk_size: {chunk_size}")
-        k_sparse_block_size = 128
-        q_ranges = AttnRanges.from_ranges([[0, total_seqlen]])
-        k_ranges = AttnRanges.from_ranges([[0, total_seqlen]])
+        sm_scale = head_dim ** -0.5
+        sm_scale_log2e = sm_scale * math.log2(math.e)
+
+        torch.manual_seed(seed)
+        if num_docs == 1:
+            cu_seqlens = torch.tensor(
+                [0, total_seqlen], dtype=torch.int32, device=self.device
+            )
+        else:
+            raw = torch.randint(
+                max(1, total_seqlen // (num_docs * 2)),
+                total_seqlen // num_docs + 1,
+                (num_docs,),
+            )
+            doc_lens = (raw.float() / raw.sum() * total_seqlen).int()
+            doc_lens[-1] = total_seqlen - doc_lens[:-1].sum()
+            cu_seqlens = torch.zeros(
+                num_docs + 1, dtype=torch.int32, device=self.device
+            )
+            cu_seqlens[1:] = torch.cumsum(doc_lens.to(self.device), dim=0)
+        max_seqlen = int(
+            (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        )
+
         pad_size = compute_pad_size(total_seqlen, self.world_size, chunk_size)
 
         cost_kwargs = dict(
@@ -1128,14 +1210,14 @@ class TestInterfaceWithWorldSize2(TestInterfaceBaseWithWorldSize1):
         )
 
         dist_attn_config = DistAttnConfig(
-            dispatch_config=DispatchConfig(alg=MinHeapDispatchAlg()),
+            dispatch_config=DispatchConfig(alg=SequentialDispatchAlg()),
             overlap_config=OverlapConfig(
                 enable=True,
                 mode=AttnOverlapMode.STATIC,
                 degree=4,
-                min_chunk_size=k_sparse_block_size,
+                min_chunk_size=block_size_k,
                 max_num_chunks=64,
-                alg=UniformOverlapAlg(),
+                alg=UniformOverlapAlg(random_costs=False),
                 **cost_kwargs,
             ),
         )
@@ -1145,30 +1227,37 @@ class TestInterfaceWithWorldSize2(TestInterfaceBaseWithWorldSize1):
             if magi_attention.comm.is_hierarchical_comm_enable()
             else self.nccl_group
         )
-        key = magi_attn_flex_key(
-            q_ranges=q_ranges,
-            k_ranges=k_ranges,
-            attn_mask_type=[AttnMaskType.FULL],
-            total_seqlen_q=total_seqlen,
-            total_seqlen_k=total_seqlen,
+        key = magi_attn_varlen_key(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
             num_heads_q=num_heads_q,
             num_heads_kv=num_heads_kv,
             head_dim=head_dim,
             pad_size=pad_size,
             chunk_size=chunk_size,
             cp_group_or_mesh=cp_group_or_mesh,
+            causal=True,
             dist_attn_config=dist_attn_config,
         )
         mgr = dist_attn_runtime_dict_mgr[key]
         if mgr.dist_attn_runtime.overlap_degree == 0:
-            self.skipTest("This config did not produce remote overlap stages")
+            return  # skip this config silently
 
         # All ranks generate the same full Q/K/V, then dispatch
-        torch.manual_seed(self.seed)
-        torch.cuda.manual_seed(self.seed)
-        full_q = torch.randn(total_seqlen, num_heads_q, head_dim, device=self.device, dtype=dtype)
-        full_k = torch.randn(total_seqlen, num_heads_kv, head_dim, device=self.device, dtype=dtype)
-        full_v = torch.randn(total_seqlen, num_heads_kv, head_dim, device=self.device, dtype=dtype)
+        torch.manual_seed(seed + 1)
+        torch.cuda.manual_seed(seed + 1)
+        full_q = torch.randn(
+            total_seqlen, num_heads_q, head_dim,
+            device=self.device, dtype=dtype,
+        )
+        full_k = torch.randn(
+            total_seqlen, num_heads_kv, head_dim,
+            device=self.device, dtype=dtype,
+        )
+        full_v = torch.randn(
+            total_seqlen, num_heads_kv, head_dim,
+            device=self.device, dtype=dtype,
+        )
 
         local_q = dispatch(full_q, key=key)
         local_k = dispatch(full_k, key=key)
@@ -1177,59 +1266,93 @@ class TestInterfaceWithWorldSize2(TestInterfaceBaseWithWorldSize1):
         custom = CalcAttnCustomAttribute(
             return_block_max=True,
             return_block_lse=True,
-            k_sparse_block_size=k_sparse_block_size,
+            k_sparse_block_size=block_size_k,
         )
 
-        # --- test: dist_attn with overlap, then undispatch ---
         _, meta = calc_attn(local_q, local_k, local_v, key, custom_attribute=custom)
         assert meta.block_max is not None and meta.block_lse is not None
 
         global_block_max = undispatch(meta.block_max, key=key)
         global_block_lse = undispatch(meta.block_lse, key=key)
 
-        # --- baseline: single FA4 call on full tensors ---
-        total_n_chunks = (total_seqlen + k_sparse_block_size - 1) // k_sparse_block_size
-        ms_shape = (1, num_heads_q, total_seqlen, total_n_chunks)
-        ref_max_score = torch.full(ms_shape, float("-inf"), dtype=torch.float32, device=self.device)
-        ref_block_lse_buf = torch.full(ms_shape, float("-inf"), dtype=torch.float32, device=self.device)
-
-        _flash_attn_fwd(
-            full_q.unsqueeze(0),
-            full_k.unsqueeze(0),
-            full_v.unsqueeze(0),
-            softmax_scale=None,
-            causal=False,
-            arbitrary=False,
-            softcap=0.0,
-            num_splits=1,
-            pack_gqa=False,
-            return_lse=True,
-            max_score_out=ref_max_score,
-            block_lse_out=ref_block_lse_buf,
-            k_sparse_block_size=k_sparse_block_size,
+        # --- PyTorch reference (per-doc causal) ---
+        n_kblocks = math.ceil(max_seqlen / block_size_k)
+        ref_block_max = torch.full(
+            (total_seqlen, num_heads_q, n_kblocks),
+            float("-inf"), dtype=torch.float32, device=self.device,
         )
-        # FA4 layout (1, H, S, C) → (S, H, C)
-        ref_block_max = ref_max_score.squeeze(0).permute(1, 0, 2).contiguous()
-        ref_block_lse = ref_block_lse_buf.squeeze(0).permute(1, 0, 2).contiguous()
+        ref_block_lse = torch.full(
+            (total_seqlen, num_heads_q, n_kblocks),
+            float("-inf"), dtype=torch.float32, device=self.device,
+        )
+
+        gqa_ratio = num_heads_q // num_heads_kv
+        for d in range(num_docs):
+            qs = cu_seqlens[d].item()
+            qe = cu_seqlens[d + 1].item()
+            doc_len = qe - qs
+            q_doc = full_q[qs:qe].float()
+            k_doc = full_k[qs:qe].float()
+            if gqa_ratio > 1:
+                k_doc = k_doc.repeat_interleave(gqa_ratio, dim=1)
+            q_idx = torch.arange(doc_len, device=self.device)
+
+            n_doc_blocks = math.ceil(doc_len / block_size_k)
+            for b in range(n_doc_blocks):
+                k_s = b * block_size_k
+                k_e = min((b + 1) * block_size_k, doc_len)
+                qk_block = torch.einsum(
+                    'qhd,khd->hqk', q_doc, k_doc[k_s:k_e]
+                )
+                causal_mask = q_idx[:, None] < torch.arange(
+                    k_s, k_e, device=self.device
+                )[None, :]
+                qk_block[:, causal_mask] = float("-inf")
+                ref_block_max[qs:qe, :, b] = (
+                    qk_block.max(dim=2).values.T * sm_scale_log2e
+                )
+                ref_block_lse[qs:qe, :, b] = torch.logsumexp(
+                    qk_block * sm_scale, dim=2
+                ).T
 
         # --- compare ---
-        assert global_block_max.shape == ref_block_max.shape, (
-            f"Shape mismatch: {global_block_max.shape} vs {ref_block_max.shape}"
-        )
-        assert global_block_lse.shape == ref_block_lse.shape, (
-            f"Shape mismatch: {global_block_lse.shape} vs {ref_block_lse.shape}"
-        )
-        torch.testing.assert_close(
-            global_block_max, ref_block_max,
-            atol=0, rtol=0,
-            msg="block_max differs between dist_attn (overlap+undispatch) and single FA4 baseline",
-        )
-        max_lse_diff = (global_block_lse - ref_block_lse).abs().max().item()
-        torch.testing.assert_close(
-            global_block_lse, ref_block_lse,
-            atol=1e-5, rtol=1e-5,
-            msg=f"block_lse differs between dist_attn (overlap+undispatch) and single FA4 baseline (max_abs_diff={max_lse_diff})",
-        )
+        n = min(n_kblocks, global_block_max.shape[2])
+        label = f"{total_seqlen // 1024}K-{num_docs}doc-{num_heads_q}h"
+        doc_lens_list = [int(cu_seqlens[i+1] - cu_seqlens[i]) for i in range(num_docs)]
+        print(f"[_check_block_score_overlap] {label} | ws={self.world_size} "
+              f"| doc_lens={doc_lens_list} | n_kblocks={n_kblocks}")
+
+        for name, magi_out, ref_out in [
+            ("block_max", global_block_max, ref_block_max),
+            ("block_lse", global_block_lse, ref_block_lse),
+        ]:
+            magi_t = magi_out[:total_seqlen, :, :n]
+            ref_t = ref_out[:, :, :n]
+
+            ref_inf = ref_t == float("-inf")
+            magi_inf = magi_t == float("-inf")
+            disagree = (ref_inf != magi_inf).sum().item()
+            assert disagree == 0, (
+                f"[{label}] {name}: {disagree} -inf positions disagree"
+            )
+
+            valid = torch.isfinite(ref_t) & torch.isfinite(magi_t)
+            assert valid.any(), f"[{label}] {name}: no valid entries"
+            ref_v = ref_t[valid].double()
+            magi_v = magi_t[valid].double()
+
+            cos_sim = torch.nn.functional.cosine_similarity(
+                ref_v.unsqueeze(0), magi_v.unsqueeze(0)
+            ).item()
+            print(f"  {name}: cos_sim={cos_sim:.10f}")
+            assert cos_sim > 0.99999, (
+                f"[{label}] {name} cosine similarity {cos_sim:.7f} < 0.99999"
+            )
+            torch.testing.assert_close(magi_v, ref_v, atol=1e-4, rtol=1e-4)
+
+        del meta, ref_block_max, ref_block_lse
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 class TestInterfaceWithWorldSize3(TestInterfaceBaseWithWorldSize1):

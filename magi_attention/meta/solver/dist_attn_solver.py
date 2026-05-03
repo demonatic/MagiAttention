@@ -369,6 +369,7 @@ class DistAttnSolver(BaseDistAttnSolver):
         self.total_seqlen_q = dispatch_meta_q.total_seqlen
         self.shard_seqlen_q = dispatch_meta_q.shard_seqlen
         self.total_seqlen_k = dispatch_meta_k.total_seqlen
+        self.global_k_ranges = k_ranges
 
         # Init host rank entry for this rank
         self.host_rank_entry_this_rank = self._init_host_rank_entry_this_rank(
@@ -1903,6 +1904,27 @@ class DistAttnSolver(BaseDistAttnSolver):
             if not e.remote_k_ranges_global.is_empty() and e.remote_k_ranges_global.start < host_k_start
         )
 
+        # ---   compute global cu_seqlens_k and host_q_start for block scoring   --- #
+
+        global_cu_seqlens_k: list[int] = []
+        host_q_start_global = 0
+        full_k_start_global = 0
+        if (
+            magi_attention.is_fa4_backend_enable()
+            and not magi_attention.is_sdpa_backend_enable()
+            and self.global_k_ranges.is_cu_seqlens(self.total_seqlen_k)
+        ):
+            global_cu_seqlens_k = self.global_k_ranges.to_cu_seqlens(self.total_seqlen_k)
+            if not self.host_q_ranges_global.is_empty():
+                host_q_start_global = self.host_q_ranges_global.start
+            if not self.remote_k_ranges_global.is_empty():
+                full_k_start_global = min(
+                    self.remote_k_ranges_global.start,
+                    self.host_k_ranges_global.start,
+                )
+            elif not self.host_k_ranges_global.is_empty():
+                full_k_start_global = self.host_k_ranges_global.start
+
         # ---   build attn calc meta   --- #
 
         calc_meta = CalcMeta(
@@ -1912,6 +1934,9 @@ class DistAttnSolver(BaseDistAttnSolver):
             seqlen_k_local=self.total_seqlen_k - sum(seqlen_k_per_remote_stage),
             seqlen_k_per_remote_stage=seqlen_k_per_remote_stage,
             host_stage_insert_idx=host_stage_insert_idx,
+            global_cu_seqlens_k=global_cu_seqlens_k,
+            host_q_start_global=host_q_start_global,
+            full_k_start_global=full_k_start_global,
         )
 
         return calc_meta

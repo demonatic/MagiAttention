@@ -32,7 +32,7 @@ from magi_attention.meta.collection import CalcMeta, CommMeta
 from magi_attention.meta.collection.calc_meta import AttnArg
 from magi_attention.utils import is_same_process_group, max_fp_dtype, nvtx
 
-from .fa4 import fa4_bwd, fa4_fwd
+from .fa4 import fa4_bwd, fa4_fwd, _triton_block_score
 from .flex_flash_attn import _flex_flash_attn_backward, _flex_flash_attn_forward
 from .sdpa import sdpa_bwd, sdpa_fwd
 from .utils import calc_lse_sink_compiled, correct_attn_out_lse, sink_bwd_compiled
@@ -3006,6 +3006,21 @@ class DistAttnFunc(torch.autograd.Function):
             dist_attn_runtime.fwd_kernel_barrier_reduce_target
         )
 
+        # whether we need to compute block_max/block_lse via reassembled K
+        want_blocks = (
+            custom_attribute is not None
+            and (custom_attribute.return_block_max or custom_attribute.return_block_lse)
+            and dist_attn_runtime.overlap_degree > 0
+        )
+        if want_blocks:
+            ca_for_stages = CalcAttnCustomAttribute(
+                k_sparse_block_size=custom_attribute.k_sparse_block_size,
+                max_per_doc_seqlen_k=custom_attribute.max_per_doc_seqlen_k,
+            )
+            remote_k_chunks: list[torch.Tensor] = []
+        else:
+            ca_for_stages = custom_attribute
+
         # get local qkv and pre-fetch qkv for remote stage(s)
         local_q, local_kv = dist_attn_runtime.get_curr_q_kv_and_fetch_next(
             local_q=local_q,
@@ -3026,23 +3041,13 @@ class DistAttnFunc(torch.autograd.Function):
             softcap=softcap,
             sink=global_sink,
             return_max_logits=return_max_logits,
-            custom_attribute=custom_attribute,
+            custom_attribute=ca_for_stages,
         )
         assert partial_local_out is not None and partial_local_meta is not None
         partial_local_lse = partial_local_meta.lse
         partial_local_max_logits = partial_local_meta.max_logits
         local_block_max = partial_local_meta.block_max
         local_block_lse = partial_local_meta.block_lse
-
-        # whether we need to collect block_max/block_lse from remote stages
-        want_blocks = (
-            custom_attribute is not None
-            and (custom_attribute.return_block_max or custom_attribute.return_block_lse)
-            and dist_attn_runtime.overlap_degree > 0
-        )
-        if want_blocks:
-            remote_block_maxes: list[torch.Tensor | None] = []
-            remote_block_lses: list[torch.Tensor | None] = []
 
         # loop into remote stages
         for ith_overlap_stage in range(dist_attn_runtime.overlap_degree):
@@ -3065,6 +3070,16 @@ class DistAttnFunc(torch.autograd.Function):
                 overlap_stage=ith_overlap_stage,
                 kernel_barrier=kernel_barrier_fetch,
             )
+
+            # save K chunk for block scoring reassembly
+            if want_blocks:
+                remote_k, _ = dist_attn_runtime._maybe_chunk(
+                    curr_remote_kv, num_chunks=2
+                )
+                sk = dist_attn_runtime.calc_meta.seqlen_k_per_remote_stage[
+                    ith_overlap_stage
+                ]
+                remote_k_chunks.append(remote_k[:sk].clone())
 
             if not dist_attn_runtime.is_last_remote_stage(
                 overlap_stage=ith_overlap_stage
@@ -3096,22 +3111,13 @@ class DistAttnFunc(torch.autograd.Function):
                 softcap=softcap,
                 sink=global_sink,
                 return_max_logits=return_max_logits,
-                custom_attribute=custom_attribute,
+                custom_attribute=ca_for_stages,
             )
             partial_remote_lse = (
                 partial_remote_meta.lse if partial_remote_meta is not None else None
             )
             if return_max_logits and partial_remote_meta is not None:
                 partial_local_max_logits = partial_remote_meta.max_logits
-
-            # collect block_max/block_lse from remote stages
-            if want_blocks:
-                if partial_remote_meta is not None:
-                    remote_block_maxes.append(partial_remote_meta.block_max)
-                    remote_block_lses.append(partial_remote_meta.block_lse)
-                else:
-                    remote_block_maxes.append(None)
-                    remote_block_lses.append(None)
 
             # reset kernel barrier for next stage
             kernel_barrier_reduce.reset()
@@ -3143,53 +3149,102 @@ class DistAttnFunc(torch.autograd.Function):
         else:
             local_max_logits = None
 
-        # concatenate block_max/block_lse from all stages in global KV order
+        # compute block_max/block_lse from reassembled full K via Triton kernel
         if want_blocks:
             calc_meta = dist_attn_runtime.calc_meta
             k_blk = custom_attribute.k_sparse_block_size
-            sq, nh = local_q.shape[0], local_q.shape[1]
+            sq = local_q.shape[0]
             dev = local_q.device
             insert_idx = calc_meta.host_stage_insert_idx
 
-            # build ordered lists: insert host among remote stages
-            ordered_blocks = list(remote_block_maxes)
-            ordered_blocks.insert(insert_idx, local_block_max)
-            ordered_lses = list(remote_block_lses)
-            ordered_lses.insert(insert_idx, local_block_lse)
+            local_k, _ = dist_attn_runtime._maybe_chunk(local_kv, num_chunks=2)
+
+            ordered_k = list(remote_k_chunks)
+            ordered_k.insert(insert_idx, local_k[:calc_meta.seqlen_k_local])
             ordered_sk = list(calc_meta.seqlen_k_per_remote_stage)
             ordered_sk.insert(insert_idx, calc_meta.seqlen_k_local)
 
-            def _fill_and_cat(
-                items: list[torch.Tensor | None],
-                seqlen_ks: list[int],
-                want: bool,
-            ) -> torch.Tensor | None:
-                if not want:
-                    return None
-                parts: list[torch.Tensor] = []
-                for blk, sk in zip(items, seqlen_ks):
-                    nc = (sk + k_blk - 1) // k_blk
-                    if nc == 0:
-                        continue  # idle stage with no KV
-                    if blk is not None:
-                        parts.append(blk)
-                    else:
-                        parts.append(
-                            torch.full(
-                                (sq, nh, nc),
-                                float("-inf"),
-                                dtype=torch.float32,
-                                device=dev,
-                            )
-                        )
-                return torch.cat(parts, dim=2) if parts else None
+            parts_k = [
+                kc[:sk] for kc, sk in zip(ordered_k, ordered_sk) if sk > 0
+            ]
+            full_k = torch.cat(parts_k, dim=0) if parts_k else None
 
-            local_block_max = _fill_and_cat(
-                ordered_blocks, ordered_sk, custom_attribute.return_block_max
-            )
-            local_block_lse = _fill_and_cat(
-                ordered_lses, ordered_sk, custom_attribute.return_block_lse
-            )
+            if full_k is not None and calc_meta.global_cu_seqlens_k:
+                global_cu_k = calc_meta.global_cu_seqlens_k
+                host_q_start = calc_meta.host_q_start_global
+                host_q_end = host_q_start + sq
+                k_start = calc_meta.full_k_start_global
+                k_end = k_start + full_k.shape[0]
+
+                max_doc_k = max(
+                    global_cu_k[i + 1] - global_cu_k[i]
+                    for i in range(len(global_cu_k) - 1)
+                )
+                global_max_seqblock = (max_doc_k + k_blk - 1) // k_blk
+
+                cu_q_list: list[int] = [0]
+                cu_k_list: list[int] = [0]
+                q_offs: list[int] = []
+                k_acc = 0
+                for i in range(len(global_cu_k) - 1):
+                    doc_start = global_cu_k[i]
+                    doc_end = global_cu_k[i + 1]
+                    kl = max(k_start, doc_start)
+                    kr = min(k_end, doc_end)
+                    if kl >= kr:
+                        continue
+                    doc_k_len = kr - kl
+                    k_acc += doc_k_len
+                    cu_k_list.append(k_acc)
+
+                    q_lo = max(host_q_start, doc_start)
+                    q_hi = min(host_q_end, doc_end)
+                    if q_lo >= q_hi:
+                        cu_q_list.append(cu_q_list[-1])
+                        q_offs.append(0)
+                    else:
+                        cu_q_list.append(q_hi - host_q_start)
+                        q_offs.append(q_lo - kl)
+
+                cu_q = torch.tensor(cu_q_list, dtype=torch.int32, device=dev)
+                cu_k_t = torch.tensor(cu_k_list, dtype=torch.int32, device=dev)
+                q_offsets_t = torch.tensor(q_offs, dtype=torch.int32, device=dev)
+
+                _sm_scale = (
+                    local_q.shape[-1] ** -0.5
+                    if softmax_scale is None
+                    else softmax_scale
+                )
+
+                local_block_max, local_block_lse = _triton_block_score(
+                    local_q,
+                    full_k,
+                    cu_q,
+                    cu_k_t,
+                    softmax_scale=_sm_scale,
+                    k_sparse_block_size=k_blk,
+                    return_block_lse=custom_attribute.return_block_lse,
+                    sink=global_sink,
+                    q_offsets=q_offsets_t,
+                )
+
+                local_seqblock = local_block_max.shape[2]
+                if local_seqblock < global_max_seqblock:
+                    pad_n = global_max_seqblock - local_seqblock
+                    local_block_max = torch.nn.functional.pad(
+                        local_block_max, (0, pad_n), value=float("-inf"),
+                    )
+                    if local_block_lse is not None:
+                        local_block_lse = torch.nn.functional.pad(
+                            local_block_lse, (0, pad_n), value=float("-inf"),
+                        )
+                if not custom_attribute.return_block_max:
+                    local_block_max = None
+                if not custom_attribute.return_block_lse:
+                    local_block_lse = None
+            else:
+                local_block_max = None
+                local_block_lse = None
 
         if dist_attn_runtime.save_tail_stage:
             last_stage_q, last_stage_kv = curr_remote_q, curr_remote_kv

@@ -63,7 +63,7 @@ if is_fa4_installed:
         triton.Config({"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3),
         triton.Config({"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 256}, num_warps=8, num_stages=2),
     ],
-    key=["qk_head_dim", "block_size", "HAS_BLOCK_LSE"],
+    key=["qk_head_dim", "block_size", "HAS_BLOCK_LSE", "HAS_Q_OFFSETS"],
 )
 @triton.jit
 def _flash_block_score_kernel(
@@ -72,8 +72,10 @@ def _flash_block_score_kernel(
     sink_ptr,
     score_ptr,
     block_lse_ptr,
-    cu_seqlens,
+    cu_seqlens_q,
+    cu_seqlens_k,
     cu_seqblocks,
+    q_offsets_ptr,
     num_heads,
     gqa_group_size,
     qk_head_dim,
@@ -98,6 +100,7 @@ def _flash_block_score_kernel(
     BLOCK_SIZE_KD: tl.constexpr,
     HAS_SINK: tl.constexpr,
     HAS_BLOCK_LSE: tl.constexpr,
+    HAS_Q_OFFSETS: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     tl.static_assert(BLOCK_SIZE_K >= block_size)
@@ -108,31 +111,41 @@ def _flash_block_score_kernel(
     pid_h = pid_bh % num_heads
     pid_kh = pid_h // gqa_group_size
 
-    seq_start = tl.load(cu_seqlens + pid_b)
-    seq_len = tl.load(cu_seqlens + pid_b + 1) - seq_start
-    if BLOCK_SIZE_Q * pid_q >= seq_len:
+    q_start = tl.load(cu_seqlens_q + pid_b)
+    q_len = tl.load(cu_seqlens_q + pid_b + 1) - q_start
+    if BLOCK_SIZE_Q * pid_q >= q_len:
         return
+
+    if HAS_Q_OFFSETS:
+        k_start = tl.load(cu_seqlens_k + pid_b)
+        k_len = tl.load(cu_seqlens_k + pid_b + 1) - k_start
+        q_offset = tl.load(q_offsets_ptr + pid_b)
+    else:
+        k_start = q_start
+        k_len = q_len
+        q_offset = 0
+
     block_num = tl.load(cu_seqblocks + pid_b + 1) - tl.load(cu_seqblocks + pid_b)
 
     q_ptrs = tl.make_block_ptr(
-        base=q_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
-        shape=(seq_len, qk_head_dim),
+        base=q_ptr + q_start * stride_q_n + pid_h * stride_q_h,
+        shape=(q_len, qk_head_dim),
         strides=(stride_q_n, stride_q_d),
         offsets=(pid_q * BLOCK_SIZE_Q, 0),
         block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_KD),
         order=(1, 0),
     )
     k_ptrs = tl.make_block_ptr(
-        base=k_ptr + seq_start * stride_k_n + pid_kh * stride_k_h,
-        shape=(qk_head_dim, seq_len),
+        base=k_ptr + k_start * stride_k_n + pid_kh * stride_k_h,
+        shape=(qk_head_dim, k_len),
         strides=(stride_k_d, stride_k_n),
         offsets=(0, 0),
         block_shape=(BLOCK_SIZE_KD, BLOCK_SIZE_K),
         order=(0, 1),
     )
     s_ptrs = tl.make_block_ptr(
-        base=score_ptr + seq_start * stride_s_q + pid_h * stride_s_h,
-        shape=(seq_len, block_num),
+        base=score_ptr + q_start * stride_s_q + pid_h * stride_s_h,
+        shape=(q_len, block_num),
         strides=(stride_s_q, stride_s_k),
         offsets=(pid_q * BLOCK_SIZE_Q, 0),
         block_shape=(BLOCK_SIZE_Q, BLOCKS_PER_K_BLOCK),
@@ -140,8 +153,8 @@ def _flash_block_score_kernel(
     )
     if HAS_BLOCK_LSE:
         bl_ptrs = tl.make_block_ptr(
-            base=block_lse_ptr + seq_start * stride_bl_q + pid_h * stride_bl_h,
-            shape=(seq_len, block_num),
+            base=block_lse_ptr + q_start * stride_bl_q + pid_h * stride_bl_h,
+            shape=(q_len, block_num),
             strides=(stride_bl_q, stride_bl_k),
             offsets=(pid_q * BLOCK_SIZE_Q, 0),
             block_shape=(BLOCK_SIZE_Q, BLOCKS_PER_K_BLOCK),
@@ -157,11 +170,11 @@ def _flash_block_score_kernel(
             other=0,
         )
 
-    off_q = tl.arange(0, BLOCK_SIZE_Q) + pid_q * BLOCK_SIZE_Q
+    off_q = tl.arange(0, BLOCK_SIZE_Q) + pid_q * BLOCK_SIZE_Q + q_offset
     off_k = tl.arange(0, BLOCK_SIZE_K)
 
-    diag_start = pid_q * BLOCK_SIZE_Q // BLOCK_SIZE_K * BLOCK_SIZE_K
-    hi = min(seq_len, (pid_q + 1) * BLOCK_SIZE_Q)
+    diag_start = (pid_q * BLOCK_SIZE_Q + q_offset) // BLOCK_SIZE_K * BLOCK_SIZE_K
+    hi = min(k_len, (pid_q + 1) * BLOCK_SIZE_Q + q_offset)
 
     for i in tl.range(0, hi, BLOCK_SIZE_K, num_stages=3):
         k = tl.load(k_ptrs, boundary_check=(1, 0), padding_option="zero")
@@ -175,9 +188,9 @@ def _flash_block_score_kernel(
 
         if HAS_BLOCK_LSE:
             p = tl.exp2(qk_3d - score[:, :, None])
-            if i + BLOCK_SIZE_K > seq_len:
+            if i + BLOCK_SIZE_K > k_len:
                 off_k_r = tl.reshape(off_k, (BLOCKS_PER_K_BLOCK, block_size))
-                k_valid = (i + off_k_r)[None, :, :] < seq_len
+                k_valid = (i + off_k_r)[None, :, :] < k_len
                 p = tl.where(k_valid, p, 0.0)
             s = tl.sum(p, axis=2)
             safe_m = tl.where(score > float("-inf"), score, 0.0)
@@ -199,11 +212,17 @@ def _triton_block_score(
     k_sparse_block_size: int = 128,
     return_block_lse: bool = False,
     sink: torch.Tensor | None = None,
+    q_offsets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Compute per-K-block max scores and optionally per-K-block LSE.
 
     Uses the same causal flash-scoring approach as ``_flash_max_score_kernel``
     (large blocks, multi-stage pipelining, causal loop bound).
+
+    When ``q_offsets`` is provided, Q and K may have different cu_seqlens
+    (e.g. CP>1 where Q is a local shard but K is the full sequence).
+    ``q_offsets[d]`` gives the starting position of local Q within doc *d*'s
+    full sequence, used for correct causal masking.
 
     Returns:
         (block_max, block_lse) in shape (total_q, num_heads_q, n_kblocks).
@@ -215,8 +234,8 @@ def _triton_block_score(
     gqa_group_size = num_heads_q // num_heads_kv
     batch_size = cu_seqlens_q.shape[0] - 1
 
-    doc_lens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-    doc_blocks = (doc_lens + k_sparse_block_size - 1) // k_sparse_block_size
+    doc_lens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+    doc_blocks = (doc_lens_k + k_sparse_block_size - 1) // k_sparse_block_size
     cu_seqblocks = torch.zeros(batch_size + 1, dtype=torch.int32, device=q.device)
     cu_seqblocks[1:] = torch.cumsum(doc_blocks, dim=0)
     max_seqblock = int(doc_blocks.max().item())
@@ -236,10 +255,16 @@ def _triton_block_score(
             device=q.device,
         )
 
-    max_seqlen = int(doc_lens.max().item())
+    has_q_offsets = q_offsets is not None
+    if has_q_offsets:
+        doc_lens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+        max_seqlen_q = int(doc_lens_q.max().item())
+    else:
+        max_seqlen_q = int(doc_lens_k.max().item())
+        q_offsets = cu_seqlens_q  # dummy, not accessed
 
     def grid(META):
-        return (triton.cdiv(max_seqlen, META["BLOCK_SIZE_Q"]), batch_size * num_heads_q)
+        return (triton.cdiv(max_seqlen_q, META["BLOCK_SIZE_Q"]), batch_size * num_heads_q)
 
     _flash_block_score_kernel[grid](
         q,
@@ -248,7 +273,9 @@ def _triton_block_score(
         score,
         block_lse if block_lse is not None else score,
         cu_seqlens_q,
+        cu_seqlens_k,
         cu_seqblocks,
+        q_offsets,
         num_heads_q,
         gqa_group_size,
         head_dim,
@@ -269,6 +296,7 @@ def _triton_block_score(
         (block_lse if block_lse is not None else score).stride(1),
         (block_lse if block_lse is not None else score).stride(2),
         HAS_BLOCK_LSE=return_block_lse,
+        HAS_Q_OFFSETS=has_q_offsets,
     )
 
     # Permute from (num_heads, total_q, n_kblocks) to (total_q, num_heads, n_kblocks)
