@@ -213,6 +213,7 @@ def _triton_block_score(
     return_block_lse: bool = False,
     sink: torch.Tensor | None = None,
     q_offsets: torch.Tensor | None = None,
+    score_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Compute per-K-block max scores and optionally per-K-block LSE.
 
@@ -240,10 +241,11 @@ def _triton_block_score(
     cu_seqblocks[1:] = torch.cumsum(doc_blocks, dim=0)
     max_seqblock = int(doc_blocks.max().item())
 
+    _score_dtype = score_dtype if score_dtype is not None else q.dtype
     score = torch.full(
         (num_heads_q, total_q, max_seqblock),
         float("-inf"),
-        dtype=torch.float32,
+        dtype=_score_dtype,
         device=q.device,
     )
     block_lse = None
