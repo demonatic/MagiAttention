@@ -358,6 +358,7 @@ def fa4_fwd(
     return_block_lse: bool = False,
     k_sparse_block_size: int = 128,
     max_seqlen_k: int | None = None,
+    score_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     assert is_fa4_installed, "FlashAttn4 is not installed"
     assert isinstance(attn_arg, FA4AttnArg), "FA4 is only supported for FA4AttnArg"
@@ -431,6 +432,7 @@ def fa4_fwd(
                 k_sparse_block_size=k_sparse_block_size,
                 return_block_lse=want_block_lse,
                 sink=sink,
+                score_dtype=score_dtype,
             )
             if want_max_score:
                 max_score_sqh = triton_score
@@ -448,7 +450,7 @@ def fa4_fwd(
                 )
             shape_ms = fa4_max_score_shape(q, k, k_sparse_block_size=k_sparse_block_size, max_seqlen_k=max_seqlen_k)
             if want_max_score:
-                ms_buf = torch.full(shape_ms, float("-inf"), dtype=torch.float32, device=q.device)
+                ms_buf = torch.full(shape_ms, float("-inf"), dtype=score_dtype or torch.float32, device=q.device)
                 fwd_kw["max_score_out"] = ms_buf
                 fwd_kw["k_sparse_block_size"] = k_sparse_block_size
             if want_block_lse:

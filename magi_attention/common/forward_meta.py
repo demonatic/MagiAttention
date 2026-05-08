@@ -26,6 +26,7 @@ class CalcAttnCustomAttribute:
     """
 
     return_block_max: bool = False
+    return_block_max_dtype: torch.dtype = torch.float32
     return_block_lse: bool = False
     k_sparse_block_size: int = 128
     max_per_doc_seqlen_k: int | None = None
@@ -43,9 +44,11 @@ class AttnForwardMeta:
             this is a replicated tensor where each device holds the global maximum
             computed across the entire sequence, ensuring consistency across all devices.
         block_max: Per-K-block max scores (FA4 ``max_score``), shape
-            ``(seqlen_q, num_heads_q, ceil(seqlen_k / k_sparse_block_size))``, float32;
-            ``None`` if not requested.  When ``overlap_degree > 0``, the last dimension
-            spans all stages concatenated in global KV order.
+            ``(seqlen_q, num_heads_q, ceil(seqlen_k / k_sparse_block_size))``,
+            dtype controlled by ``CalcAttnCustomAttribute.return_block_max_dtype``
+            (default float32); ``None`` if not requested.  When
+            ``overlap_degree > 0``, the last dimension spans all stages
+            concatenated in global KV order.
         block_lse: Per-K-block scaled LSE (FA4 ``block_lse_out``), same shape as
             ``block_max``; ``None`` if not requested.
     """
