@@ -32,7 +32,7 @@ from magi_attention.meta.collection import CalcMeta, CommMeta
 from magi_attention.meta.collection.calc_meta import AttnArg
 from magi_attention.utils import is_same_process_group, max_fp_dtype, nvtx
 
-from .fa4 import fa4_bwd, fa4_fwd, _triton_block_score
+from .fa4 import fa4_bwd, fa4_fwd, triton_block_score_lse
 from .flex_flash_attn import _flex_flash_attn_backward, _flex_flash_attn_forward
 from .sdpa import sdpa_bwd, sdpa_fwd
 from .utils import calc_lse_sink_compiled, correct_attn_out_lse, sink_bwd_compiled
@@ -3217,7 +3217,7 @@ class DistAttnFunc(torch.autograd.Function):
                     else softmax_scale
                 )
 
-                local_block_max, local_block_lse = _triton_block_score(
+                local_block_max, local_block_lse = triton_block_score_lse(
                     local_q,
                     full_k,
                     cu_q,
@@ -3225,7 +3225,6 @@ class DistAttnFunc(torch.autograd.Function):
                     softmax_scale=_sm_scale,
                     k_sparse_block_size=k_blk,
                     return_block_lse=custom_attribute.return_block_lse,
-                    sink=global_sink,
                     q_offsets=q_offsets_t,
                     score_dtype=custom_attribute.return_block_max_dtype,
                 )

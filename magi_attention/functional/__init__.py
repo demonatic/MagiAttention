@@ -15,7 +15,7 @@
 
 from .dispatch import dispatch_func, undispatch_func
 from .dist_attn import dist_attn_func
-from .fa4 import ffa_fa4_func
+from .fa4 import ffa_fa4_func, triton_block_score_lse
 from .flex_flash_attn import flex_flash_attn_func
 from .utils import (
     correct_attn_lse,
@@ -32,6 +32,7 @@ __all__ = [
     "dist_attn_func",
     "dispatch_func",
     "undispatch_func",
+    "triton_block_score_lse",
     "correct_attn_out_lse",
     "correct_attn_out",
     "correct_attn_lse",

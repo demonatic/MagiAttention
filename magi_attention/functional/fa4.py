@@ -23,6 +23,20 @@ from magi_attention.common.enum import AttnSinkLayout
 from magi_attention.common.ranges import AttnRanges
 from magi_attention.meta.collection.calc_meta import AttnArg, FA4AttnArg
 
+try:
+    _make_tensor_descriptor = tl.make_tensor_descriptor
+except Exception:
+    _make_tensor_descriptor = tl._experimental_make_tensor_descriptor
+
+
+def _default_alloc_fn(size: int, alignment: int, stream: int | None):
+    return torch.empty(
+        size, device=torch.device("cuda", torch.cuda.current_device()), dtype=torch.int8
+    )
+
+
+triton.set_allocator(_default_alloc_fn)
+
 is_fa4_installed = False
 try:
     from flash_attn_cute.interface import _flash_attn_bwd, _flash_attn_fwd
@@ -38,17 +52,12 @@ if is_fa4_installed:
 
 
 # ---------------------------------------------------------------------------
-# Triton kernel: per-K-block max score and optional block LSE
-# Based on _flash_max_score_kernel from flash_idx.py — causal, large blocks,
-# multi-stage pipelining.
+# Triton kernel: per-K-block max score and optional block LSE.
+# Ported from Megatron's _flash_attn_fwd_block_score_lse_only_kernel with
+# extensions for separate cu_seqlens_q/k and q_offsets (CP support).
 # ---------------------------------------------------------------------------
 
-@triton.heuristics(
-    {
-        "BLOCK_SIZE_KD": lambda args: triton.next_power_of_2(args["qk_head_dim"]),
-        "HAS_SINK": lambda args: args["sink_ptr"] is not None,
-    }
-)
+@triton.heuristics({"BLOCK_SIZE_KD": lambda args: triton.next_power_of_2(args["qk_head_dim"])})
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=2),
@@ -62,16 +71,19 @@ if is_fa4_installed:
         triton.Config({"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2),
         triton.Config({"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3),
         triton.Config({"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 256}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_Q": 32, "BLOCK_SIZE_K": 256}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 256}, num_warps=8, num_stages=1),
     ],
-    key=["qk_head_dim", "block_size", "HAS_BLOCK_LSE", "HAS_Q_OFFSETS"],
+    key=["qk_head_dim", "block_size", "HAS_BLOCK_LSE", "HAS_Q_OFFSETS",
+         "USE_TMA", "USE_LSE_TEMP", "SCORE_TYPE"],
+    cache_results=True,
 )
 @triton.jit
-def _flash_block_score_kernel(
+def _flash_attn_fwd_block_score_lse_only_kernel(
     q_ptr,
     k_ptr,
-    sink_ptr,
     score_ptr,
-    block_lse_ptr,
+    blse_ptr,
     cu_seqlens_q,
     cu_seqlens_k,
     cu_seqblocks,
@@ -81,34 +93,30 @@ def _flash_block_score_kernel(
     qk_head_dim,
     block_size: tl.constexpr,
     sm_scale,
-    stride_q_n,
-    stride_q_h,
-    stride_q_d,
-    stride_k_n,
-    stride_k_h,
-    stride_k_d,
-    stride_sink_h,
-    stride_sink_d,
-    stride_s_h,
-    stride_s_q,
-    stride_s_k,
-    stride_bl_h,
-    stride_bl_q,
-    stride_bl_k,
+    lse_temp,
+    stride_q_n, stride_q_h, stride_q_d,
+    stride_k_n, stride_k_h, stride_k_d,
+    stride_s_h, stride_s_q, stride_s_k,
+    stride_blse_h, stride_blse_n, stride_blse_k,
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_KD: tl.constexpr,
-    HAS_SINK: tl.constexpr,
     HAS_BLOCK_LSE: tl.constexpr,
     HAS_Q_OFFSETS: tl.constexpr,
+    USE_TMA: tl.constexpr,
+    USE_LSE_TEMP: tl.constexpr,
+    SCORE_TYPE: tl.constexpr,
 ):
+    tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
+    if USE_LSE_TEMP:
+        inv_lse_temp = 1.0 / lse_temp
     tl.static_assert(BLOCK_SIZE_K >= block_size)
     BLOCKS_PER_K_BLOCK: tl.constexpr = BLOCK_SIZE_K // block_size
 
-    pid_q, pid_bh = tl.program_id(0), tl.program_id(1)
-    pid_b = pid_bh // num_heads
-    pid_h = pid_bh % num_heads
+    pid_q = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_h = tl.program_id(2)
     pid_kh = pid_h // gqa_group_size
 
     q_start = tl.load(cu_seqlens_q + pid_b)
@@ -135,14 +143,22 @@ def _flash_block_score_kernel(
         block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_KD),
         order=(1, 0),
     )
-    k_ptrs = tl.make_block_ptr(
-        base=k_ptr + k_start * stride_k_n + pid_kh * stride_k_h,
-        shape=(qk_head_dim, k_len),
-        strides=(stride_k_d, stride_k_n),
-        offsets=(0, 0),
-        block_shape=(BLOCK_SIZE_KD, BLOCK_SIZE_K),
-        order=(0, 1),
-    )
+    if USE_TMA:
+        k_desc = _make_tensor_descriptor(
+            base=k_ptr + k_start * stride_k_n + pid_kh * stride_k_h,
+            shape=(k_len, qk_head_dim),
+            strides=(stride_k_n, stride_k_d),
+            block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_KD),
+        )
+    else:
+        k_ptrs = tl.make_block_ptr(
+            base=k_ptr + k_start * stride_k_n + pid_kh * stride_k_h,
+            shape=(qk_head_dim, k_len),
+            strides=(stride_k_d, stride_k_n),
+            offsets=(0, 0),
+            block_shape=(BLOCK_SIZE_KD, BLOCK_SIZE_K),
+            order=(0, 1),
+        )
     s_ptrs = tl.make_block_ptr(
         base=score_ptr + q_start * stride_s_q + pid_h * stride_s_h,
         shape=(q_len, block_num),
@@ -152,58 +168,68 @@ def _flash_block_score_kernel(
         order=(1, 0),
     )
     if HAS_BLOCK_LSE:
-        bl_ptrs = tl.make_block_ptr(
-            base=block_lse_ptr + q_start * stride_bl_q + pid_h * stride_bl_h,
+        blse_ptrs = tl.make_block_ptr(
+            base=blse_ptr + q_start * stride_blse_n + pid_h * stride_blse_h,
             shape=(q_len, block_num),
-            strides=(stride_bl_q, stride_bl_k),
+            strides=(stride_blse_n, stride_blse_k),
             offsets=(pid_q * BLOCK_SIZE_Q, 0),
             block_shape=(BLOCK_SIZE_Q, BLOCKS_PER_K_BLOCK),
             order=(1, 0),
         )
 
     q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
-    if HAS_SINK:
-        off_d = tl.arange(0, BLOCK_SIZE_KD)
-        sink = tl.load(
-            sink_ptr + pid_h * stride_sink_h + off_d * stride_sink_d,
-            mask=off_d < qk_head_dim,
-            other=0,
-        )
-
     off_q = tl.arange(0, BLOCK_SIZE_Q) + pid_q * BLOCK_SIZE_Q + q_offset
     off_k = tl.arange(0, BLOCK_SIZE_K)
+    m_i = tl.full((BLOCK_SIZE_Q,), float("-inf"), dtype=tl.float32)
 
     diag_start = (pid_q * BLOCK_SIZE_Q + q_offset) // BLOCK_SIZE_K * BLOCK_SIZE_K
     hi = min(k_len, (pid_q + 1) * BLOCK_SIZE_Q + q_offset)
-
-    for i in tl.range(0, hi, BLOCK_SIZE_K, num_stages=3):
-        k = tl.load(k_ptrs, boundary_check=(1, 0), padding_option="zero")
+    for i in tl.range(0, hi, BLOCK_SIZE_K):
+        if USE_TMA:
+            k = tl.trans(k_desc.load([i, 0]))
+        else:
+            k = tl.load(k_ptrs, boundary_check=(1, 0), padding_option="zero")
         qk = tl.dot(q, k) * sm_scale_log2e
         if i >= diag_start:
             qk = tl.where(off_q[:, None] >= (i + off_k)[None, :], qk, float("-inf"))
 
-        qk_3d = tl.reshape(qk, (BLOCK_SIZE_Q, BLOCKS_PER_K_BLOCK, block_size), can_reorder=False)
-        score = tl.max(qk_3d, axis=2)
-        tl.store(s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1))
+        qk_blocks = tl.reshape(
+            qk, (BLOCK_SIZE_Q, BLOCKS_PER_K_BLOCK, block_size), can_reorder=False
+        )
+        sub_max = tl.max(qk_blocks, axis=2)
 
         if HAS_BLOCK_LSE:
-            p = tl.exp2(qk_3d - score[:, :, None])
-            if i + BLOCK_SIZE_K > k_len:
-                off_k_r = tl.reshape(off_k, (BLOCKS_PER_K_BLOCK, block_size))
-                k_valid = (i + off_k_r)[None, :, :] < k_len
-                p = tl.where(k_valid, p, 0.0)
-            s = tl.sum(p, axis=2)
-            safe_m = tl.where(score > float("-inf"), score, 0.0)
-            blse = safe_m * 0.6931471806 + tl.log(tl.where(s > 0.0, s, 1e-20))
-            blse = tl.where(s > 0.0, blse, float("-inf"))
-            tl.store(bl_ptrs, blse.to(block_lse_ptr.dtype.element_ty), boundary_check=(0, 1))
-            bl_ptrs = tl.advance(bl_ptrs, (0, BLOCKS_PER_K_BLOCK))
+            if USE_LSE_TEMP:
+                block_lse = (
+                    tl.log2(tl.sum(tl.exp2((qk_blocks - sub_max[:, :, None]) * inv_lse_temp), axis=2))
+                    + sub_max * inv_lse_temp
+                )
+            else:
+                max_qk = tl.max(qk, axis=1)
+                m_ij = tl.maximum(m_i, max_qk)
+                p = tl.exp2(qk - m_ij[:, None])
+                p_blocks = tl.reshape(
+                    p, (BLOCK_SIZE_Q, BLOCKS_PER_K_BLOCK, block_size), can_reorder=False
+                )
+                block_lse = m_ij[:, None] + tl.log2(tl.sum(p_blocks, axis=2))
+                m_i = m_ij
+            block_lse = tl.where(block_lse != block_lse, float("-inf"), block_lse)
+            tl.store(blse_ptrs, block_lse.to(blse_ptr.dtype.element_ty), boundary_check=(0, 1))
+            blse_ptrs = tl.advance(blse_ptrs, (0, BLOCKS_PER_K_BLOCK))
+
+        if SCORE_TYPE == "max":
+            score = sub_max
+        else:
+            score = sub_max + tl.log2(tl.sum(tl.exp2(qk_blocks - sub_max[:, :, None]), axis=2))
+            score = tl.where(score != score, float("-inf"), score)
+        tl.store(s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1))
 
         s_ptrs = tl.advance(s_ptrs, (0, BLOCKS_PER_K_BLOCK))
-        k_ptrs = tl.advance(k_ptrs, (0, BLOCK_SIZE_K))
+        if not USE_TMA:
+            k_ptrs = tl.advance(k_ptrs, (0, BLOCK_SIZE_K))
 
 
-def _triton_block_score(
+def triton_block_score_lse(
     q: torch.Tensor,
     k: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
@@ -211,14 +237,13 @@ def _triton_block_score(
     softmax_scale: float,
     k_sparse_block_size: int = 128,
     return_block_lse: bool = False,
-    sink: torch.Tensor | None = None,
     q_offsets: torch.Tensor | None = None,
     score_dtype: torch.dtype | None = None,
+    use_tma: bool = True,
+    lse_temp: float = 1.0,
+    score_type: str = "max",
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Compute per-K-block max scores and optionally per-K-block LSE.
-
-    Uses the same causal flash-scoring approach as ``_flash_max_score_kernel``
-    (large blocks, multi-stage pipelining, causal loop bound).
 
     When ``q_offsets`` is provided, Q and K may have different cu_seqlens
     (e.g. CP>1 where Q is a local shard but K is the full sequence).
@@ -228,7 +253,7 @@ def _triton_block_score(
     Returns:
         (block_max, block_lse) in shape (total_q, num_heads_q, n_kblocks).
         block_max: per-block max(QK * sm_scale * log2e) in log2 scale.
-        block_lse: ln(sum(exp(sm_scale * QK))) per block, or None.
+        block_lse: log2(sum(exp2(sm_scale * log2e * QK))) per block, or None.
     """
     total_q, num_heads_q, head_dim = q.shape
     num_heads_kv = k.shape[1]
@@ -266,12 +291,11 @@ def _triton_block_score(
         q_offsets = cu_seqlens_q  # dummy, not accessed
 
     def grid(META):
-        return (triton.cdiv(max_seqlen_q, META["BLOCK_SIZE_Q"]), batch_size * num_heads_q)
+        return (triton.cdiv(max_seqlen_q, META["BLOCK_SIZE_Q"]), batch_size, num_heads_q)
 
-    _flash_block_score_kernel[grid](
+    _flash_attn_fwd_block_score_lse_only_kernel[grid](
         q,
         k,
-        sink,
         score,
         block_lse if block_lse is not None else score,
         cu_seqlens_q,
@@ -283,14 +307,13 @@ def _triton_block_score(
         head_dim,
         k_sparse_block_size,
         softmax_scale,
+        lse_temp,
         q.stride(0),
         q.stride(1),
         q.stride(2),
         k.stride(0),
         k.stride(1),
         k.stride(2),
-        sink.stride(0) if sink is not None else 0,
-        sink.stride(1) if sink is not None else 0,
         score.stride(0),
         score.stride(1),
         score.stride(2),
@@ -299,12 +322,17 @@ def _triton_block_score(
         (block_lse if block_lse is not None else score).stride(2),
         HAS_BLOCK_LSE=return_block_lse,
         HAS_Q_OFFSETS=has_q_offsets,
+        USE_TMA=use_tma,
+        USE_LSE_TEMP=(lse_temp != 1.0),
+        SCORE_TYPE=score_type,
     )
 
     # Permute from (num_heads, total_q, n_kblocks) to (total_q, num_heads, n_kblocks)
     score = score.permute(1, 0, 2).contiguous()
     if block_lse is not None:
-        block_lse = block_lse.permute(1, 0, 2).contiguous()
+        # Kernel computes block_lse in log2 scale; convert to natural log
+        # to match downstream convention (torch.logsumexp / FA4 native).
+        block_lse = (block_lse * math.log(2)).permute(1, 0, 2).contiguous()
 
     return score, block_lse
 
@@ -426,12 +454,11 @@ def fa4_fwd(
                 dtype=torch.int32,
                 device=q.device,
             )
-            triton_score, triton_blse = _triton_block_score(
+            triton_score, triton_blse = triton_block_score_lse(
                 q, k, cu_q, cu_k,
                 softmax_scale=_softmax_scale,
                 k_sparse_block_size=k_sparse_block_size,
                 return_block_lse=want_block_lse,
-                sink=sink,
                 score_dtype=score_dtype,
             )
             if want_max_score:
