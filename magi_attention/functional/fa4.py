@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import inspect
 import math
 from typing import Optional
 
@@ -337,39 +336,6 @@ def triton_block_score_lse(
     return score, block_lse
 
 
-def flash_attn_fwd_supports_max_score_out() -> bool:
-    """True if installed ``flash_attn_cute._flash_attn_fwd`` accepts ``max_score_out``."""
-    if not is_fa4_installed:
-        return False
-    return "max_score_out" in inspect.signature(_flash_attn_fwd).parameters
-
-
-def flash_attn_fwd_supports_block_lse_out() -> bool:
-    """True if installed ``flash_attn_cute._flash_attn_fwd`` accepts ``block_lse_out``."""
-    if not is_fa4_installed:
-        return False
-    return "block_lse_out" in inspect.signature(_flash_attn_fwd).parameters
-
-
-def fa4_max_score_shape(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    *,
-    k_sparse_block_size: int = 128,
-    max_seqlen_k: int | None = None,
-) -> tuple[int, int, int, int]:
-    """Shape for ``max_score_out`` as passed to FA4 (with batch dim): ``(1, num_head, seqlen_q, n_k_chunks)``.
-
-    When ``max_seqlen_k`` is provided (per-doc mode), the K-block dimension
-    is ``ceil(max_seqlen_k / k_sparse_block_size)`` instead of using the full
-    ``k.shape[0]``.
-    """
-    seqlen_q, num_head = q.shape[0], q.shape[1]
-    eff_k = max_seqlen_k if max_seqlen_k is not None else k.shape[0]
-    n_chunks = (eff_k + k_sparse_block_size - 1) // k_sparse_block_size
-    return (1, num_head, seqlen_q, n_chunks)
-
-
 @torch.no_grad()
 def fa4_fwd(
     q: torch.Tensor,
@@ -380,28 +346,22 @@ def fa4_fwd(
     softmax_scale: float | None = None,
     softcap: float = 0.0,
     sink_layout: AttnSinkLayout = "sh",
-    max_score_out: Optional[torch.Tensor] = None,
     return_max_score: bool = False,
-    block_lse_out: Optional[torch.Tensor] = None,
     return_block_lse: bool = False,
     k_sparse_block_size: int = 128,
-    max_seqlen_k: int | None = None,
     score_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     assert is_fa4_installed, "FlashAttn4 is not installed"
     assert isinstance(attn_arg, FA4AttnArg), "FA4 is only supported for FA4AttnArg"
 
-    want_max_score = return_max_score or max_score_out is not None
-    want_block_lse = return_block_lse or block_lse_out is not None
-
     _softmax_scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
 
-    # --- FA4 base forward (always without block outputs for speed) ---
     fa4_args = attn_arg.to_fa4_args(is_bwd=False)
     block_sparse = fa4_args["linear_k_block_sparse_mask"]
 
     q_b, k_b, v_b = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
-    fwd_kw: dict = dict(
+    out, lse = _flash_attn_fwd(
+        q_b, k_b, v_b,
         softmax_scale=softmax_scale,
         causal=False,
         arbitrary=True,
@@ -417,78 +377,38 @@ def fa4_fwd(
         aux_tensors=fa4_args["aux_tensors"],
     )
 
-    # Pre-allocated block outputs passed by caller bypass the Triton path
-    if max_score_out is not None:
-        fwd_kw["max_score_out"] = max_score_out
-        fwd_kw["k_sparse_block_size"] = k_sparse_block_size
-    if block_lse_out is not None:
-        fwd_kw["block_lse_out"] = block_lse_out
-        fwd_kw["k_sparse_block_size"] = k_sparse_block_size
-
-    out, lse = _flash_attn_fwd(q_b, k_b, v_b, **fwd_kw)
-
     out = out.squeeze(0)
     lse = lse.squeeze(0).mT
 
-    # --- Block outputs from pre-allocated buffers (legacy path) ---
+    # --- Triton block scoring (separate kernel, decoupled from FA4 fwd) ---
     max_score_sqh: Optional[torch.Tensor] = None
-    if max_score_out is not None:
-        max_score_sqh = max_score_out.squeeze(0).permute(1, 0, 2).contiguous()
-
     block_lse_sqh: Optional[torch.Tensor] = None
-    if block_lse_out is not None:
-        block_lse_sqh = block_lse_out.squeeze(0).permute(1, 0, 2).contiguous()
-
-    # --- Triton block scoring (replaces slow FA4 block outputs) ---
-    if (want_max_score or want_block_lse) and max_score_out is None and block_lse_out is None:
+    if return_max_score or return_block_lse:
         k_ranges = attn_arg.k_ranges
         q_ranges = attn_arg.q_ranges
-        if k_ranges.is_cu_seqlens(k.shape[0]) and q_ranges.is_cu_seqlens(q.shape[0]):
-            cu_k = torch.tensor(
-                k_ranges.to_cu_seqlens(k.shape[0]),
-                dtype=torch.int32,
-                device=q.device,
-            )
-            cu_q = torch.tensor(
-                q_ranges.to_cu_seqlens(q.shape[0]),
-                dtype=torch.int32,
-                device=q.device,
-            )
-            triton_score, triton_blse = triton_block_score_lse(
-                q, k, cu_q, cu_k,
-                softmax_scale=_softmax_scale,
-                k_sparse_block_size=k_sparse_block_size,
-                return_block_lse=want_block_lse,
-                score_dtype=score_dtype,
-            )
-            if want_max_score:
-                max_score_sqh = triton_score
-            if want_block_lse and triton_blse is not None:
-                block_lse_sqh = triton_blse
-        else:
-            # Fallback: ranges not cu_seqlens-compatible, use FA4 native (slow)
-            if want_max_score and not flash_attn_fwd_supports_max_score_out():
-                raise RuntimeError(
-                    "return_max_score requires FlashAttention cute build with max_score_out support."
-                )
-            if want_block_lse and not flash_attn_fwd_supports_block_lse_out():
-                raise RuntimeError(
-                    "return_block_lse requires FlashAttention cute build with block_lse_out support."
-                )
-            shape_ms = fa4_max_score_shape(q, k, k_sparse_block_size=k_sparse_block_size, max_seqlen_k=max_seqlen_k)
-            if want_max_score:
-                ms_buf = torch.full(shape_ms, float("-inf"), dtype=score_dtype or torch.float32, device=q.device)
-                fwd_kw["max_score_out"] = ms_buf
-                fwd_kw["k_sparse_block_size"] = k_sparse_block_size
-            if want_block_lse:
-                bl_buf = torch.full(shape_ms, float("-inf"), dtype=torch.float32, device=q.device)
-                fwd_kw["block_lse_out"] = bl_buf
-                fwd_kw["k_sparse_block_size"] = k_sparse_block_size
-            _, _ = _flash_attn_fwd(q_b, k_b, v_b, **fwd_kw)
-            if want_max_score:
-                max_score_sqh = ms_buf.squeeze(0).permute(1, 0, 2).contiguous()
-            if want_block_lse:
-                block_lse_sqh = bl_buf.squeeze(0).permute(1, 0, 2).contiguous()
+        assert k_ranges.is_cu_seqlens(k.shape[0]) and q_ranges.is_cu_seqlens(q.shape[0]), \
+            "triton_block_score_lse requires cu_seqlens-compatible ranges"
+        cu_k = torch.tensor(
+            k_ranges.to_cu_seqlens(k.shape[0]),
+            dtype=torch.int32,
+            device=q.device,
+        )
+        cu_q = torch.tensor(
+            q_ranges.to_cu_seqlens(q.shape[0]),
+            dtype=torch.int32,
+            device=q.device,
+        )
+        triton_score, triton_blse = triton_block_score_lse(
+            q, k, cu_q, cu_k,
+            softmax_scale=_softmax_scale,
+            k_sparse_block_size=k_sparse_block_size,
+            return_block_lse=return_block_lse,
+            score_dtype=score_dtype,
+        )
+        if return_max_score:
+            max_score_sqh = triton_score
+        if return_block_lse and triton_blse is not None:
+            block_lse_sqh = triton_blse
 
     return out, lse, max_score_sqh, block_lse_sqh
 
