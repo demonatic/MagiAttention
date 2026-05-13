@@ -151,7 +151,7 @@ def load_precompiled_ffa_fa4():
                     key = pickle.load(f)
 
                 # Load the .so file as a module using cute.runtime
-                mod = cute.runtime.load_module(so_path)
+                mod = cute.runtime.load_module(so_path, enable_tvm_ffi=True)
                 raw_func = getattr(mod, KERNEL_SYMBOL_NAME)
 
                 # Wrap the raw function with kwargs wrapper to match the expected signature
