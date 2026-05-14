@@ -19,10 +19,10 @@ from magi_attention.functional.fa4_utils import precompile_ffa_fa4
 if __name__ == "__main__":
     # Define the parameter space for grid search
     # to pre-compile ffa fa4 kernels for common cases
-    dtypes = [torch.float16, torch.bfloat16]
+    dtypes = [torch.bfloat16]
     head_dims = [80, 128]
-    qhead_per_kvhead = [1, 4, 8, 16]
-    func_nums = [1, 3, 5, 7]
+    qhead_per_kvhead = [1, 2, 4, 8, 16]
+    func_nums = [1, 3]
 
     # Pre-compile the kernels for all combinations
     # in the defined parameter space
