@@ -350,6 +350,7 @@ def fa4_fwd(
     return_block_lse: bool = False,
     k_sparse_block_size: int = 128,
     score_dtype: torch.dtype | None = None,
+    lse_temp: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     assert is_fa4_installed, "FlashAttn4 is not installed"
     assert isinstance(attn_arg, FA4AttnArg), "FA4 is only supported for FA4AttnArg"
@@ -404,6 +405,7 @@ def fa4_fwd(
             k_sparse_block_size=k_sparse_block_size,
             return_block_lse=return_block_lse,
             score_dtype=score_dtype,
+            lse_temp=lse_temp,
         )
         if return_max_score:
             max_score_sqh = triton_score

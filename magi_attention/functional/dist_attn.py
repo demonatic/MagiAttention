@@ -1269,6 +1269,7 @@ class DistAttnRuntime:
                     return_block_lse=want_bl,
                     k_sparse_block_size=k_blk,
                     score_dtype=custom_attribute.return_block_max_dtype if custom_attribute is not None else None,
+                    lse_temp=custom_attribute.lse_temp if custom_attribute is not None else 1.0,
                 )
                 meta = AttnForwardMeta(
                     lse=partial_lse,
@@ -3226,6 +3227,7 @@ class DistAttnFunc(torch.autograd.Function):
                     return_block_lse=custom_attribute.return_block_lse,
                     q_offsets=q_offsets_t,
                     score_dtype=custom_attribute.return_block_max_dtype,
+                    lse_temp=custom_attribute.lse_temp,
                 )
 
                 local_seqblock = local_block_max.shape[2]
