@@ -82,10 +82,13 @@ BACKENDS = "backends"
 # Targeted Blackwell FA4 arbitrary-mask coverage for Q/K head_dim=192 with V=128.
 # On SM100, FA4AttnArg resolves mask tiles to (128, 128), so these cases exercise
 # the d192/k128 arbitrary path without expanding the full backend/config matrix.
+# Configs are chosen with chunk_size >= 512 so the dispatched merged_attn_arg
+# produces a tractable n_func (CuTeDSL bwd compile time scales superlinearly with
+# n_func; small chunk_size on 7+ k_range masks blows n_func past 400 and stalls).
 FA4_D192_K128_ARBITRARY_CONFIGS = {
-    "sdpa_uneven_varlen_900",
-    "sdpa_varlen_full_attn_1050",
-    "sdpa_varlen_block_causal_960",
+    "varlen_full_attn_12k",
+    "varlen_block_causal_12k_with_q_overlap",
+    "uneven_varlen_11k",
 }
 FA4_D192_K128_VALUE_HEAD_DIM = 128
 
